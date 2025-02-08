@@ -15,7 +15,7 @@ Simple dynamic WireGuard endpoint service.
 Intended to run as a systemd service on Linux (adaptable to macOS via launchd).
 
 Usage example:
-    sudo python3 wg_endpoint_service.py --wg-interface wg0 --port 51880 \
+    sudo python3 wg_endpoint_service.py --wg-interface wg0 --port 51820 \
       --allowed-source-ips 10.220.0.19,10.220.0.25 --use-sudo --user nobody --group nogroup
 """
 
@@ -233,7 +233,7 @@ def parse_args():
     parser.add_argument('--wg-interface', default='wg0', help='Name of the WireGuard interface (default: wg0)')
     parser.add_argument('--bind-ip', default=None,
                         help='IP address to bind the HTTP server to (default: IP of the WG interface)')
-    parser.add_argument('--port', type=int, default=51880, help='Port number for the HTTP server (default: 51880)')
+    parser.add_argument('--port', type=int, default=51820, help='Port number for the HTTP server (default: 51820)')
     parser.add_argument('--allowed-source-ips', default='',
                         help='Comma-separated list of allowed source IP addresses (default: empty, will add bind IP automatically)')
     parser.add_argument('--use-sudo', action='store_true', help='Use sudo when running wg commands (default: False)')
