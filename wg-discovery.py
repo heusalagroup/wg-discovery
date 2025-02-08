@@ -93,9 +93,9 @@ def drop_privileges(user, group):
 
 
 class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
-    def __init__(self, *args, wg_interface, allowed_source_ips, use_sudo, **kwargs):
+    def __init__(self, *args, wg_interface, allowed_ips, use_sudo, **kwargs):
         self.wg_interface = wg_interface
-        self.allowed_source_ips = allowed_source_ips
+        self.allowed_ips = allowed_ips
         self.use_sudo = use_sudo
         super().__init__(*args, **kwargs)
 
@@ -113,11 +113,11 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
 
     def _check_source_ip(self):
         # If no allowed source IPs are provided, allow all.
-        if not self.allowed_source_ips:
+        if not self.allowed_ips:
             return True
 
         client_ip = self.client_address[0]
-        if client_ip not in self.allowed_source_ips:
+        if client_ip not in self.allowed_ips:
             logging.warning("Rejected connection from unauthorized IP: %s", client_ip)
             self._send_response(403, f"Forbidden: IP {client_ip} is not allowed.")
             return False
@@ -186,10 +186,10 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         logging.info("%s - %s", self.address_string(), format % args)
 
 
-def run_server(bind_ip, port, wg_interface, allowed_source_ips, use_sudo, drop_user, drop_group):
+def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group):
     handler_class = partial(WGEndpointHandler,
                             wg_interface=wg_interface,
-                            allowed_source_ips=allowed_source_ips,
+                            allowed_ips=allowed_ips,
                             use_sudo=use_sudo)
     with socketserver.TCPServer((bind_ip, port), handler_class) as httpd:
         logging.info("Starting WG endpoint service on http://%s:%d/", bind_ip, port)
@@ -234,15 +234,15 @@ def main():
             sys.exit(1)
 
     port = args.port
-    allowed_source_ips = {ip.strip() for ip in args.allowed_source_ips.split(',') if ip.strip()}
-    allowed_source_ips.add(bind_ip)
+    allowed_ips = {ip.strip() for ip in args.allowed_ips.split(',') if ip.strip()}
+    allowed_ips.add(bind_ip)
     use_sudo = args.use_sudo
     drop_user = args.user if args.user != "" else None
     drop_group = args.group if args.group != "" else None
 
-    logging.info("Configuration: wg_interface=%s, bind_ip=%s, port=%d, allowed_source_ips=%s, use_sudo=%s, user=%s, group=%s",
-                 wg_interface, bind_ip, port, allowed_source_ips, use_sudo, drop_user, drop_group)
-    run_server(bind_ip, port, wg_interface, allowed_source_ips, use_sudo, drop_user, drop_group)
+    logging.info("Configuration: wg_interface=%s, bind_ip=%s, port=%d, allowed_ips=%s, use_sudo=%s, user=%s, group=%s",
+                 wg_interface, bind_ip, port, allowed_ips, use_sudo, drop_user, drop_group)
+    run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group)
 
 
 if __name__ == "__main__":
