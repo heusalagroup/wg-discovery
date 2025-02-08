@@ -9,7 +9,7 @@ Simple dynamic WireGuard endpoint service.
 - Automatically determines the local IP of the selected WireGuard interface
   if --bind-ip is not provided.
 - Automatically adds the bind IP to the allowed source IPs.
-- Returns error messages in responses when errors occur.
+- Returns error messages and responses in JSON format.
 - Optionally drops privileges to a specified user and group.
 
 Intended to run as a systemd service on Linux (adaptable to macOS via launchd).
@@ -92,41 +92,63 @@ def drop_privileges(user, group):
     logging.info("Dropped privileges to user %s (UID: %d, GID: %d)", user, uid, gid)
 
 
+def parse_wg_endpoints(output):
+    """
+    Parse the output from 'wg show <interface> endpoints' into a JSON object.
+    Expected output format:
+      peer: <peer_public_key>
+        endpoint: <ip>:<port>
+    Returns a dictionary like:
+      { "peers": [ { "peer": "<peer_public_key>", "endpoint": "<ip>:<port>" }, ... ] }
+    """
+    peers = []
+    current_peer = None
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("peer:"):
+            # New peer entry.
+            peer_key = line.split("peer:", 1)[1].strip()
+            current_peer = {"peer": peer_key}
+            peers.append(current_peer)
+        elif line.startswith("endpoint:") and current_peer is not None:
+            endpoint = line.split("endpoint:", 1)[1].strip()
+            current_peer["endpoint"] = endpoint
+    return {"peers": peers}
+
+
 class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
+
     def __init__(self, *args, wg_interface, allowed_ips, use_sudo, **kwargs):
         self.wg_interface = wg_interface
         self.allowed_ips = allowed_ips
         self.use_sudo = use_sudo
         super().__init__(*args, **kwargs)
 
-    def _send_response(self, code, message, content_type="text/plain"):
+    def _send_json_response(self, code, data):
         """
-        Send an HTTP response with the given status code, message, and content type.
-        The message can be a str or bytes.
+        Send an HTTP JSON response with the given status code.
+        The data argument should be serializable to JSON.
         """
+        response = json.dumps(data)
         self.send_response(code)
-        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Type", "application/json")
         self.end_headers()
-        if isinstance(message, str):
-            message = message.encode("utf-8")
-        self.wfile.write(message)
+        self.wfile.write(response.encode("utf-8"))
 
     def _check_source_ip(self):
-        # If no allowed source IPs are provided, allow all.
+        # If no allowed IPs are provided, allow all.
         if not self.allowed_ips:
             return True
-
         client_ip = self.client_address[0]
         if client_ip not in self.allowed_ips:
             logging.warning("Rejected connection from unauthorized IP: %s", client_ip)
-            self._send_response(403, f"Forbidden: IP {client_ip} is not allowed.")
+            self._send_json_response(403, {"error": f"Forbidden: IP {client_ip} is not allowed."})
             return False
         return True
 
     def do_GET(self):
         if not self._check_source_ip():
             return
-
         parsed = urlparse(self.path)
         if parsed.path == "/v1/endpoints":
             try:
@@ -140,18 +162,18 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
                     stderr=subprocess.PIPE,
                     text=True,
                 )
-                self._send_response(200, result.stdout)
+                parsed_output = parse_wg_endpoints(result.stdout)
+                self._send_json_response(200, parsed_output)
             except subprocess.CalledProcessError as e:
-                error_message = f"Internal Server Error: {e.stderr}"
+                error_message = {"error": "Internal Server Error", "message": e.stderr}
                 logging.error("Error running wg show: %s", e.stderr)
-                self._send_response(500, error_message)
+                self._send_json_response(500, error_message)
         else:
-            self._send_response(404, "Not Found")
+            self._send_json_response(404, {"error": "Not Found"})
 
     def do_POST(self):
         if not self._check_source_ip():
             return
-
         parsed = urlparse(self.path)
         if parsed.path == "/v1/update":
             content_length = int(self.headers.get("Content-Length", 0))
@@ -163,24 +185,23 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
                 if not peer_key or not new_endpoint:
                     raise ValueError("Missing peer or endpoint")
             except Exception as e:
-                error_message = f"Bad Request: Invalid JSON - {str(e)}"
+                error_message = {"error": "Bad Request", "message": f"Invalid JSON - {str(e)}"}
                 logging.error("Invalid JSON payload: %s", e)
-                self._send_response(400, error_message)
+                self._send_json_response(400, error_message)
                 return
-
             try:
                 cmd = ["wg", "set", self.wg_interface, "peer", peer_key, "endpoint", new_endpoint]
                 if self.use_sudo:
                     cmd = ["sudo"] + cmd
                 logging.info("Running command: %s", " ".join(cmd))
                 subprocess.run(cmd, check=True)
-                self._send_response(200, "Peer endpoint updated successfully")
+                self._send_json_response(200, {"message": "Peer endpoint updated successfully"})
             except subprocess.CalledProcessError as e:
-                error_message = f"Internal Server Error: Unable to update endpoint - {e.stderr}"
+                error_message = {"error": "Internal Server Error", "message": f"Unable to update endpoint - {e.stderr}"}
                 logging.error("Error updating endpoint: %s", e)
-                self._send_response(500, error_message)
+                self._send_json_response(500, error_message)
         else:
-            self._send_response(404, "Not Found")
+            self._send_json_response(404, {"error": "Not Found"})
 
     def log_message(self, format, *args):
         logging.info("%s - %s", self.address_string(), format % args)
