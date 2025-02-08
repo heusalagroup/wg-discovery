@@ -9,7 +9,7 @@ Simple dynamic WireGuard endpoint service.
 - Automatically determines the local IP of the selected WireGuard interface
   if --bind-ip is not provided.
 - Automatically adds the bind IP to the allowed source IPs.
-- Returns error messages and responses in JSON format.
+- Returns responses and error messages in JSON format.
 - Optionally drops privileges to a specified user and group.
 
 Intended to run as a systemd service on Linux (adaptable to macOS via launchd).
@@ -58,7 +58,7 @@ def get_interface_ip(ifname):
             ip_addr = socket.inet_ntoa(
                 fcntl.ioctl(
                     s.fileno(),
-                    0x8915,
+                    0x8915,  # SIOCGIFADDR
                     struct.pack('256s', ifname[:15].encode('utf-8'))
                 )[20:24]
             )
@@ -95,24 +95,30 @@ def drop_privileges(user, group):
 def parse_wg_endpoints(output):
     """
     Parse the output from 'wg show <interface> endpoints' into a JSON object.
-    Expected output format:
-      peer: <peer_public_key>
-        endpoint: <ip>:<port>
-    Returns a dictionary like:
-      { "peers": [ { "peer": "<peer_public_key>", "endpoint": "<ip>:<port>" }, ... ] }
+
+    Expected sample output (tab-separated):
+
+        1234567890+abcdedfgh+23AdJgYev355laseg88g34=	(none)
+        P92pvrbwGG12512312sxsf141tqad14raerafeag144=	1.2.3.4:51820
+        jkgashlkh1l4haf134gat235gstq5gwrtq35twtw54w=	5.6.7.8:51820
+        ...
+
+    Returns a dictionary in the form:
+      { "peers": [ { "peer": "<peer_public_key>", "endpoint": "<ip>:<port>" or null }, ... ] }
     """
     peers = []
-    current_peer = None
     for line in output.splitlines():
         line = line.strip()
-        if line.startswith("peer:"):
-            # New peer entry.
-            peer_key = line.split("peer:", 1)[1].strip()
-            current_peer = {"peer": peer_key}
-            peers.append(current_peer)
-        elif line.startswith("endpoint:") and current_peer is not None:
-            endpoint = line.split("endpoint:", 1)[1].strip()
-            current_peer["endpoint"] = endpoint
+        if not line:
+            continue
+        parts = line.split('\t')
+        if len(parts) != 2:
+            continue
+        peer_key, endpoint = parts
+        # If endpoint is "(none)", set it to null in JSON (Python: None)
+        if endpoint.lower() == "(none)":
+            endpoint = None
+        peers.append({"peer": peer_key, "endpoint": endpoint})
     return {"peers": peers}
 
 
@@ -126,8 +132,7 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
 
     def _send_json_response(self, code, data):
         """
-        Send an HTTP JSON response with the given status code.
-        The data argument should be serializable to JSON.
+        Send an HTTP response with the given status code and JSON data.
         """
         response = json.dumps(data)
         self.send_response(code)
