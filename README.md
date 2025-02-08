@@ -1,0 +1,2 @@
+# wg-discovery
+WireGuard tools
