@@ -101,12 +101,15 @@ def parse_wg_endpoints(output):
         1234567890+abcdedfgh+23AdJgYev355laseg88g34=	(none)
         P92pvrbwGG12512312sxsf141tqad14raerafeag144=	1.2.3.4:51820
         jkgashlkh1l4haf134gat235gstq5gwrtq35twtw54w=	5.6.7.8:51820
-        ...
 
     Returns a dictionary in the form:
-      { "peers": [ { "peer": "<peer_public_key>", "endpoint": "<ip>:<port>" or null }, ... ] }
+      {
+          "1234567890+abcdedfgh+23AdJgYev355laseg88g34=": null,
+          "P92pvrbwGG12512312sxsf141tqad14raerafeag144=": "1.2.3.4:51820",
+          "jkgashlkh1l4haf134gat235gstq5gwrtq35twtw54w": "5.6.7.8:51820",
+      }
     """
-    peers = []
+    endpoints = {}
     for line in output.splitlines():
         line = line.strip()
         if not line:
@@ -115,11 +118,11 @@ def parse_wg_endpoints(output):
         if len(parts) != 2:
             continue
         peer_key, endpoint = parts
-        # If endpoint is "(none)", set it to null in JSON (Python: None)
         if endpoint.lower() == "(none)":
-            endpoint = None
-        peers.append({"peer": peer_key, "endpoint": endpoint})
-    return {"peers": peers}
+            endpoints[peer_key] = None
+        else:
+            endpoints[peer_key] = endpoint
+    return endpoints
 
 
 class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
