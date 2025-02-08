@@ -3,7 +3,6 @@
 Simple dynamic WireGuard endpoint service.
 
 - Exposes current endpoint data via GET /v1/endpoints.
-- Allows updating a peer's endpoint via POST /v1/update.
 - Uses source IP filtering to restrict access (if provided).
 - All configuration is provided via command‑line arguments.
 - Automatically determines the local IP of the selected WireGuard interface
@@ -11,12 +10,17 @@ Simple dynamic WireGuard endpoint service.
 - Automatically adds the bind IP to the allowed source IPs.
 - Returns responses and error messages in JSON format.
 - Optionally drops privileges to a specified user and group.
+- Optionally runs an auto‑update thread that detects discovery peers by looping
+  through all peers from 'wg show <interface> endpoints', then periodically “pings”
+  each peer via HTTP. If a peer is inactive, the service queries discovery peers
+  for updated endpoint information and updates the local configuration.
 
 Intended to run as a systemd service on Linux (adaptable to macOS via launchd).
 
 Usage example:
     sudo python3 wg_endpoint_service.py --wg-interface wg0 --port 51820 \
-      --allowed-ips 10.220.0.19,10.220.0.25 --use-sudo --user nobody --group nogroup
+      --allowed-ips 10.220.0.19,10.220.0.25 --use-sudo --user nobody --group nogroup \
+      --auto-update --update-interval 60
 """
 
 import http.server
@@ -35,6 +39,9 @@ import pwd
 import grp
 from urllib.parse import urlparse
 from functools import partial
+import threading
+import time
+import urllib.request
 
 
 def get_interface_ip(ifname):
@@ -106,7 +113,7 @@ def parse_wg_endpoints(output):
       {
           "1234567890+abcdedfgh+23AdJgYev355laseg88g34=": null,
           "P92pvrbwGG12512312sxsf141tqad14raerafeag144=": "1.2.3.4:51820",
-          "jkgashlkh1l4haf134gat235gstq5gwrtq35twtw54w": "5.6.7.8:51820",
+          "jkgashlkh1l4haf134gat235gstq5gwrtq35twtw54w": "5.6.7.8:51820"
       }
     """
     endpoints = {}
@@ -150,7 +157,7 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         client_ip = self.client_address[0]
         if client_ip not in self.allowed_ips:
             logging.warning("Rejected connection from unauthorized IP: %s", client_ip)
-            self._send_json_response(403, {"error": f"Forbidden: IP {client_ip} is not allowed."})
+            self._send_json_response(403, {"error": "Forbidden"})
             return False
         return True
 
@@ -179,43 +186,111 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._send_json_response(404, {"error": "Not Found"})
 
-    def do_POST(self):
-        if not self._check_source_ip():
-            return
-        parsed = urlparse(self.path)
-        if parsed.path == "/v1/update":
-            content_length = int(self.headers.get("Content-Length", 0))
-            payload = self.rfile.read(content_length)
-            try:
-                data = json.loads(payload)
-                peer_key = data.get("peer")
-                new_endpoint = data.get("endpoint")
-                if not peer_key or not new_endpoint:
-                    raise ValueError("Missing peer or endpoint")
-            except Exception as e:
-                error_message = {"error": "Bad Request", "message": f"Invalid JSON - {str(e)}"}
-                logging.error("Invalid JSON payload: %s", e)
-                self._send_json_response(400, error_message)
-                return
-            try:
-                cmd = ["wg", "set", self.wg_interface, "peer", peer_key, "endpoint", new_endpoint]
-                if self.use_sudo:
-                    cmd = ["sudo"] + cmd
-                logging.info("Running command: %s", " ".join(cmd))
-                subprocess.run(cmd, check=True)
-                self._send_json_response(200, {"message": "Peer endpoint updated successfully"})
-            except subprocess.CalledProcessError as e:
-                error_message = {"error": "Internal Server Error", "message": f"Unable to update endpoint - {e.stderr}"}
-                logging.error("Error updating endpoint: %s", e)
-                self._send_json_response(500, error_message)
-        else:
-            self._send_json_response(404, {"error": "Not Found"})
-
     def log_message(self, format, *args):
         logging.info("%s - %s", self.address_string(), format % args)
 
 
-def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group):
+def auto_update_loop(wg_interface, local_port, use_sudo, update_interval):
+    """
+    Periodically check local peers for activity and update endpoints for inactive peers.
+
+    The auto-update loop works as follows:
+
+    1. It retrieves local endpoints using 'wg show <interface> endpoints'.
+    2. It then automatically detects discovery peers by iterating through all peers
+       that have a non-null endpoint. For each, it sends an HTTP GET request to
+       http://<peer_ip>:<local_port>/v1/endpoints. Peers that respond successfully
+       are considered discovery peers.
+    3. Next, for each local peer, it attempts to "ping" the peer via HTTP GET.
+       If a peer is unreachable, it loops through the discovered discovery peers
+       and queries each for updated endpoint information for that inactive peer.
+    4. If a discovery peer returns a new, non-null endpoint for the inactive peer,
+       the service updates the local WireGuard configuration accordingly.
+    """
+    while True:
+        logging.info("Auto-update loop starting iteration...")
+        try:
+            cmd = ["wg", "show", wg_interface, "endpoints"]
+            if use_sudo:
+                cmd = ["sudo"] + cmd
+            result = subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            local_endpoints = parse_wg_endpoints(result.stdout)
+        except Exception as e:
+            logging.error("Failed to get local endpoints: %s", e)
+            time.sleep(update_interval)
+            continue
+
+        # Automatically detect discovery peers from the local endpoints.
+        discovery_peers = {}
+        for peer_key, endpoint in local_endpoints.items():
+            if not endpoint:
+                continue
+            try:
+                host, _ = endpoint.split(':')
+            except Exception as e:
+                logging.error("Invalid endpoint format for peer %s: %s", peer_key, endpoint)
+                continue
+            url = f"http://{host}:{local_port}/v1/endpoints"
+            try:
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    if response.status == 200:
+                        discovery_peers[peer_key] = endpoint
+                        logging.info("Discovery peer detected: %s at %s", peer_key, endpoint)
+            except Exception as e:
+                logging.warning("Peer %s at %s is not a discovery node: %s", peer_key, endpoint, e)
+
+        # For each peer, if it's inactive, try to update its endpoint.
+        for peer_key, endpoint in local_endpoints.items():
+            if not endpoint:
+                continue
+            try:
+                host, _ = endpoint.split(':')
+            except Exception as e:
+                logging.error("Invalid endpoint format for peer %s: %s", peer_key, endpoint)
+                continue
+            url = f"http://{host}:{local_port}/v1/endpoints"
+            try:
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    if response.status == 200:
+                        logging.info("Peer %s at %s is active", peer_key, endpoint)
+                        continue  # Active, no update needed.
+            except Exception as e:
+                logging.warning("Peer %s at %s is inactive: %s", peer_key, endpoint, e)
+            # If inactive, query discovery peers for an updated endpoint.
+            new_endpoint = None
+            for disc_key, disc_endpoint in discovery_peers.items():
+                try:
+                    d_host, _ = disc_endpoint.split(':')
+                    disc_url = f"http://{d_host}:{local_port}/v1/endpoints"
+                    with urllib.request.urlopen(disc_url, timeout=5) as disc_response:
+                        if disc_response.status == 200:
+                            disc_data = json.loads(disc_response.read().decode("utf-8"))
+                            if peer_key in disc_data and disc_data[peer_key]:
+                                new_endpoint = disc_data[peer_key]
+                                logging.info("Found updated endpoint for peer %s from discovery node %s: %s", peer_key, disc_key, new_endpoint)
+                                break
+                except Exception as e:
+                    logging.warning("Error querying discovery node %s: %s", disc_key, e)
+            if new_endpoint and new_endpoint != endpoint:
+                try:
+                    cmd = ["wg", "set", wg_interface, "peer", peer_key, "endpoint", new_endpoint]
+                    if use_sudo:
+                        cmd = ["sudo"] + cmd
+                    subprocess.run(cmd, check=True)
+                    logging.info("Updated peer %s endpoint to %s", peer_key, new_endpoint)
+                except Exception as e:
+                    logging.error("Failed to update peer %s: %s", peer_key, e)
+        time.sleep(update_interval)
+
+
+def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group,
+               auto_update, update_interval):
     handler_class = partial(WGEndpointHandler,
                             wg_interface=wg_interface,
                             allowed_ips=allowed_ips,
@@ -228,6 +303,11 @@ def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, dr
             except Exception as e:
                 logging.error("Failed to drop privileges: %s", e)
                 sys.exit(1)
+        if auto_update:
+            thread = threading.Thread(target=auto_update_loop, args=(wg_interface, port, use_sudo, update_interval))
+            thread.daemon = True
+            thread.start()
+            logging.info("Auto-update thread started.")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
@@ -246,6 +326,9 @@ def parse_args():
     parser.add_argument('--use-sudo', action='store_true', help='Use sudo when running wg commands (default: False)')
     parser.add_argument('--user', default='', help='Username to drop privileges to (optional)')
     parser.add_argument('--group', default='', help='Groupname to drop privileges to (optional; defaults to user\'s primary group if not specified)')
+    parser.add_argument('--auto-update', action='store_true', help='Enable auto-update of peer endpoints (default: disabled)')
+    parser.add_argument('--update-interval', type=int, default=60,
+                        help='Interval (in seconds) between auto-update checks (default: 60)')
     return parser.parse_args()
 
 
@@ -268,10 +351,13 @@ def main():
     use_sudo = args.use_sudo
     drop_user = args.user if args.user != "" else None
     drop_group = args.group if args.group != "" else None
+    auto_update = args.auto_update
+    update_interval = args.update_interval
 
-    logging.info("Configuration: wg_interface=%s, bind_ip=%s, port=%d, allowed_ips=%s, use_sudo=%s, user=%s, group=%s",
-                 wg_interface, bind_ip, port, allowed_ips, use_sudo, drop_user, drop_group)
-    run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group)
+    logging.info("Configuration: wg_interface=%s, bind_ip=%s, port=%d, allowed_ips=%s, use_sudo=%s, auto_update=%s, update_interval=%d, user=%s, group=%s",
+                 wg_interface, bind_ip, port, allowed_ips, use_sudo, auto_update, update_interval, drop_user, drop_group)
+    run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group,
+               auto_update, update_interval)
 
 
 if __name__ == "__main__":
