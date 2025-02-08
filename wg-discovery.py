@@ -10,7 +10,7 @@ Simple dynamic WireGuard endpoint service.
 - Automatically adds the bind IP to the allowed source IPs.
 - Returns responses and error messages in JSON format.
 - Optionally drops privileges to a specified user and group.
-- Optionally runs an auto‑update thread that detects discovery peers by looping
+- Optionally runs an auto‑discovery thread that detects discovery peers by looping
   through all peers from 'wg show <interface> endpoints', then periodically “pings”
   each peer via HTTP. If a peer is inactive, the service queries discovery peers
   for updated endpoint information and updates the local configuration.
@@ -20,7 +20,7 @@ Intended to run as a systemd service on Linux (adaptable to macOS via launchd).
 Usage example:
     sudo python3 wg_endpoint_service.py --wg-interface wg0 --port 51820 \
       --allowed-ips 10.220.0.19,10.220.0.25 --use-sudo --user nobody --group nogroup \
-      --auto-update --update-interval 60
+      --auto-discovery --discovery-interval 60
 """
 
 import http.server
@@ -99,15 +99,15 @@ def drop_privileges(user, group):
     logging.info("Dropped privileges to user %s (UID: %d, GID: %d)", user, uid, gid)
 
 
-def parse_wg_endpoints(output):
+def wg_show_endpoints(wg_interface, use_sudo=False):
     """
-    Parse the output from 'wg show <interface> endpoints' into a JSON object.
+    Run 'wg show <interface> endpoints' and parse its output.
 
     Expected sample output (tab-separated):
 
-        1234567890+abcdedfgh+23AdJgYev355laseg88g34=	(none)
-        P92pvrbwGG12512312sxsf141tqad14raerafeag144=	1.2.3.4:51820
-        jkgashlkh1l4haf134gat235gstq5gwrtq35twtw54w=	5.6.7.8:51820
+        1234567890+abcdedfgh+23AdJgYev355laseg88g34=   (none)
+        P92pvrbwGG12512312sxsf141tqad14raerafeag144=   1.2.3.4:51820
+        jkgashlkh1l4haf134gat235gstq5gwrtq35twtw54w=   5.6.7.8:51820
 
     Returns a dictionary in the form:
       {
@@ -116,8 +116,12 @@ def parse_wg_endpoints(output):
           "jkgashlkh1l4haf134gat235gstq5gwrtq35twtw54w": "5.6.7.8:51820"
       }
     """
+    cmd = ["wg", "show", wg_interface, "endpoints"]
+    if use_sudo:
+        cmd = ["sudo"] + cmd
+    result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     endpoints = {}
-    for line in output.splitlines():
+    for line in result.stdout.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -151,7 +155,6 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(response.encode("utf-8"))
 
     def _check_source_ip(self):
-        # If no allowed IPs are provided, allow all.
         if not self.allowed_ips:
             return True
         client_ip = self.client_address[0]
@@ -167,17 +170,7 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/v1/endpoints":
             try:
-                cmd = ["wg", "show", self.wg_interface, "endpoints"]
-                if self.use_sudo:
-                    cmd = ["sudo"] + cmd
-                result = subprocess.run(
-                    cmd,
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                parsed_output = parse_wg_endpoints(result.stdout)
+                parsed_output = wg_show_endpoints(self.wg_interface, self.use_sudo)
                 self._send_json_response(200, parsed_output)
             except subprocess.CalledProcessError as e:
                 error_message = {"error": "Internal Server Error", "message": e.stderr}
@@ -190,43 +183,27 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         logging.info("%s - %s", self.address_string(), format % args)
 
 
-def auto_update_loop(wg_interface, local_port, use_sudo, update_interval):
+def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
     """
     Periodically check local peers for activity and update endpoints for inactive peers.
 
-    The auto-update loop works as follows:
-
-    1. It retrieves local endpoints using 'wg show <interface> endpoints'.
-    2. It then automatically detects discovery peers by iterating through all peers
-       that have a non-null endpoint. For each, it sends an HTTP GET request to
-       http://<peer_ip>:<local_port>/v1/endpoints. Peers that respond successfully
-       are considered discovery peers.
-    3. Next, for each local peer, it attempts to "ping" the peer via HTTP GET.
-       If a peer is unreachable, it loops through the discovered discovery peers
-       and queries each for updated endpoint information for that inactive peer.
-    4. If a discovery peer returns a new, non-null endpoint for the inactive peer,
-       the service updates the local WireGuard configuration accordingly.
+    1. Retrieve local endpoints using 'wg show <interface> endpoints'.
+    2. Detect discovery peers by iterating through peers with non-null endpoints and
+       pinging their HTTP service (GET /v1/endpoints) on the given local_port.
+    3. For each peer that fails the ping, loop through discovery peers and query each
+       for updated endpoint information.
+    4. If a discovery peer returns a new endpoint for the inactive peer, update the local configuration.
     """
     while True:
-        logging.info("Auto-update loop starting iteration...")
+        logging.info("Auto-discovery loop starting iteration...")
         try:
-            cmd = ["wg", "show", wg_interface, "endpoints"]
-            if use_sudo:
-                cmd = ["sudo"] + cmd
-            result = subprocess.run(
-                cmd,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            local_endpoints = parse_wg_endpoints(result.stdout)
+            local_endpoints = wg_show_endpoints(wg_interface, use_sudo)
         except Exception as e:
             logging.error("Failed to get local endpoints: %s", e)
-            time.sleep(update_interval)
+            time.sleep(discovery_interval)
             continue
 
-        # Automatically detect discovery peers from the local endpoints.
+        # Detect discovery peers from local endpoints.
         discovery_peers = {}
         for peer_key, endpoint in local_endpoints.items():
             if not endpoint:
@@ -245,7 +222,7 @@ def auto_update_loop(wg_interface, local_port, use_sudo, update_interval):
             except Exception as e:
                 logging.warning("Peer %s at %s is not a discovery node: %s", peer_key, endpoint, e)
 
-        # For each peer, if it's inactive, try to update its endpoint.
+        # For each local peer, check if it is active.
         for peer_key, endpoint in local_endpoints.items():
             if not endpoint:
                 continue
@@ -259,10 +236,10 @@ def auto_update_loop(wg_interface, local_port, use_sudo, update_interval):
                 with urllib.request.urlopen(url, timeout=5) as response:
                     if response.status == 200:
                         logging.info("Peer %s at %s is active", peer_key, endpoint)
-                        continue  # Active, no update needed.
+                        continue  # Peer is active.
             except Exception as e:
                 logging.warning("Peer %s at %s is inactive: %s", peer_key, endpoint, e)
-            # If inactive, query discovery peers for an updated endpoint.
+            # For inactive peers, query discovery peers for updated endpoint.
             new_endpoint = None
             for disc_key, disc_endpoint in discovery_peers.items():
                 try:
@@ -279,18 +256,25 @@ def auto_update_loop(wg_interface, local_port, use_sudo, update_interval):
                     logging.warning("Error querying discovery node %s: %s", disc_key, e)
             if new_endpoint and new_endpoint != endpoint:
                 try:
-                    cmd = ["wg", "set", wg_interface, "peer", peer_key, "endpoint", new_endpoint]
-                    if use_sudo:
-                        cmd = ["sudo"] + cmd
-                    subprocess.run(cmd, check=True)
+                    wg_set_peer_endpoint(wg_interface, peer_key, new_endpoint, use_sudo)
                     logging.info("Updated peer %s endpoint to %s", peer_key, new_endpoint)
                 except Exception as e:
                     logging.error("Failed to update peer %s: %s", peer_key, e)
-        time.sleep(update_interval)
+        time.sleep(discovery_interval)
+
+
+def wg_set_peer_endpoint(wg_interface, peer_key, new_endpoint, use_sudo=False):
+    """
+    Run 'wg set <interface> peer <peer_key> endpoint <new_endpoint>'.
+    """
+    cmd = ["wg", "set", wg_interface, "peer", peer_key, "endpoint", new_endpoint]
+    if use_sudo:
+        cmd = ["sudo"] + cmd
+    subprocess.run(cmd, check=True)
 
 
 def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group,
-               auto_update, update_interval):
+               auto_discovery, discovery_interval):
     handler_class = partial(WGEndpointHandler,
                             wg_interface=wg_interface,
                             allowed_ips=allowed_ips,
@@ -303,11 +287,11 @@ def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, dr
             except Exception as e:
                 logging.error("Failed to drop privileges: %s", e)
                 sys.exit(1)
-        if auto_update:
-            thread = threading.Thread(target=auto_update_loop, args=(wg_interface, port, use_sudo, update_interval))
+        if auto_discovery:
+            thread = threading.Thread(target=auto_discovery_loop, args=(wg_interface, port, use_sudo, discovery_interval))
             thread.daemon = True
             thread.start()
-            logging.info("Auto-update thread started.")
+            logging.info("Auto-discovery thread started.")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
@@ -326,9 +310,9 @@ def parse_args():
     parser.add_argument('--use-sudo', action='store_true', help='Use sudo when running wg commands (default: False)')
     parser.add_argument('--user', default='', help='Username to drop privileges to (optional)')
     parser.add_argument('--group', default='', help='Groupname to drop privileges to (optional; defaults to user\'s primary group if not specified)')
-    parser.add_argument('--auto-update', action='store_true', help='Enable auto-update of peer endpoints (default: disabled)')
-    parser.add_argument('--update-interval', type=int, default=60,
-                        help='Interval (in seconds) between auto-update checks (default: 60)')
+    parser.add_argument('--auto-discovery', action='store_true', help='Enable auto-discovery of peer endpoints (default: disabled)')
+    parser.add_argument('--discovery-interval', type=int, default=60,
+                        help='Interval (in seconds) between auto-discovery checks (default: 60)')
     return parser.parse_args()
 
 
@@ -351,13 +335,13 @@ def main():
     use_sudo = args.use_sudo
     drop_user = args.user if args.user != "" else None
     drop_group = args.group if args.group != "" else None
-    auto_update = args.auto_update
-    update_interval = args.update_interval
+    auto_discovery = args.auto_discovery
+    discovery_interval = args.discovery_interval
 
-    logging.info("Configuration: wg_interface=%s, bind_ip=%s, port=%d, allowed_ips=%s, use_sudo=%s, auto_update=%s, update_interval=%d, user=%s, group=%s",
-                 wg_interface, bind_ip, port, allowed_ips, use_sudo, auto_update, update_interval, drop_user, drop_group)
+    logging.info("Configuration: wg_interface=%s, bind_ip=%s, port=%d, allowed_ips=%s, use_sudo=%s, auto_discovery=%s, discovery_interval=%d, user=%s, group=%s",
+                 wg_interface, bind_ip, port, allowed_ips, use_sudo, auto_discovery, discovery_interval, drop_user, drop_group)
     run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group,
-               auto_update, update_interval)
+               auto_discovery, discovery_interval)
 
 
 if __name__ == "__main__":
