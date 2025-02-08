@@ -73,16 +73,12 @@ def drop_privileges(user, group):
     If group is not specified, use the user's primary group.
     """
     if os.getuid() != 0:
-        # Not running as root; nothing to do.
         return
-
     try:
         pw_record = pwd.getpwnam(user)
     except KeyError:
         raise RuntimeError(f"User '{user}' not found; cannot drop privileges.")
-
     uid = pw_record.pw_uid
-
     if group:
         try:
             gr_record = grp.getgrnam(group)
@@ -91,21 +87,29 @@ def drop_privileges(user, group):
             raise RuntimeError(f"Group '{group}' not found; cannot drop privileges.")
     else:
         gid = pw_record.pw_gid
-
-    # Drop group privileges first.
     os.setgid(gid)
-    # Drop user privileges.
     os.setuid(uid)
     logging.info("Dropped privileges to user %s (UID: %d, GID: %d)", user, uid, gid)
 
 
 class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
-
     def __init__(self, *args, wg_interface, allowed_source_ips, use_sudo, **kwargs):
         self.wg_interface = wg_interface
         self.allowed_source_ips = allowed_source_ips
         self.use_sudo = use_sudo
         super().__init__(*args, **kwargs)
+
+    def _send_response(self, code, message, content_type="text/plain"):
+        """
+        Send an HTTP response with the given status code, message, and content type.
+        The message can be a str or bytes.
+        """
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.end_headers()
+        if isinstance(message, str):
+            message = message.encode("utf-8")
+        self.wfile.write(message)
 
     def _check_source_ip(self):
         # If no allowed source IPs are provided, allow all.
@@ -115,10 +119,7 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         client_ip = self.client_address[0]
         if client_ip not in self.allowed_source_ips:
             logging.warning("Rejected connection from unauthorized IP: %s", client_ip)
-            self.send_response(403)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(f"Forbidden: IP {client_ip} is not allowed.".encode("utf-8"))
+            self._send_response(403, f"Forbidden: IP {client_ip} is not allowed.")
             return False
         return True
 
@@ -139,23 +140,13 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
                     stderr=subprocess.PIPE,
                     text=True,
                 )
-                endpoints = result.stdout
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(endpoints.encode("utf-8"))
+                self._send_response(200, result.stdout)
             except subprocess.CalledProcessError as e:
                 error_message = f"Internal Server Error: {e.stderr}"
                 logging.error("Error running wg show: %s", e.stderr)
-                self.send_response(500)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(error_message.encode("utf-8"))
+                self._send_response(500, error_message)
         else:
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"Not Found")
+            self._send_response(404, "Not Found")
 
     def do_POST(self):
         if not self._check_source_ip():
@@ -174,10 +165,7 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 error_message = f"Bad Request: Invalid JSON - {str(e)}"
                 logging.error("Invalid JSON payload: %s", e)
-                self.send_response(400)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(error_message.encode("utf-8"))
+                self._send_response(400, error_message)
                 return
 
             try:
@@ -186,22 +174,13 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
                     cmd = ["sudo"] + cmd
                 logging.info("Running command: %s", " ".join(cmd))
                 subprocess.run(cmd, check=True)
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(b"Peer endpoint updated successfully")
+                self._send_response(200, "Peer endpoint updated successfully")
             except subprocess.CalledProcessError as e:
                 error_message = f"Internal Server Error: Unable to update endpoint - {e.stderr}"
                 logging.error("Error updating endpoint: %s", e)
-                self.send_response(500)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(error_message.encode("utf-8"))
+                self._send_response(500, error_message)
         else:
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"Not Found")
+            self._send_response(404, "Not Found")
 
     def log_message(self, format, *args):
         logging.info("%s - %s", self.address_string(), format % args)
@@ -214,7 +193,6 @@ def run_server(bind_ip, port, wg_interface, allowed_source_ips, use_sudo, drop_u
                             use_sudo=use_sudo)
     with socketserver.TCPServer((bind_ip, port), handler_class) as httpd:
         logging.info("Starting WG endpoint service on http://%s:%d/", bind_ip, port)
-        # Drop privileges after binding the listening socket if --user is specified.
         if drop_user:
             try:
                 drop_privileges(drop_user, drop_group)
@@ -263,8 +241,7 @@ def main():
     drop_group = args.group if args.group != "" else None
 
     logging.info("Configuration: wg_interface=%s, bind_ip=%s, port=%d, allowed_source_ips=%s, use_sudo=%s, user=%s, group=%s",
-                 wg_interface, bind_ip, port,
-                 allowed_source_ips, use_sudo, drop_user, drop_group)
+                 wg_interface, bind_ip, port, allowed_source_ips, use_sudo, drop_user, drop_group)
     run_server(bind_ip, port, wg_interface, allowed_source_ips, use_sudo, drop_user, drop_group)
 
 
