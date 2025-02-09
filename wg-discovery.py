@@ -241,6 +241,7 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
        and send an HTTP GET to their /v1/endpoints endpoint.
     5. If a discovery peer returns a non-null endpoint for the inactive peer that differs from the current remote endpoint,
        update the local configuration and log the change (showing both the previous and new endpoints).
+    Additionally, log statistics at the end of each iteration.
     """
     while True:
         logging.info("Auto-discovery loop starting iteration...")
@@ -258,7 +259,12 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
             time.sleep(discovery_interval)
             continue
 
-        inactive_peers = {}
+        total_peers = len(allowed_ips_map)
+        active_count = 0
+        inactive_count = 0
+        updated_count = 0
+        discovery_peers = {}
+
         # Ping each peer using its allowed IP.
         for peer_key, allowed_ip in allowed_ips_map.items():
             url = f"http://{allowed_ip}:{local_port}/v1/endpoints"
@@ -266,18 +272,20 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
                 with urllib.request.urlopen(url, timeout=5) as response:
                     if response.status == 200:
                         logging.info("Peer %s at allowed IP %s is active", peer_key, allowed_ip)
+                        active_count += 1
+                        discovery_peers[peer_key] = allowed_ip
                         continue
             except Exception as e:
                 logging.debug("Peer %s at allowed IP %s is inactive: %s", peer_key, allowed_ip, e)
-                inactive_peers[peer_key] = allowed_ip
+                inactive_count += 1
 
         # For each inactive peer, query discovery peers for an updated endpoint.
-        for peer_key, old_endpoint in remote_endpoints.items():
-            # Skip if the remote endpoint is None (peer not configured)
+        for peer_key in remote_endpoints:
+            old_endpoint = remote_endpoints.get(peer_key)
             if old_endpoint is None:
-                continue
-            # If the peer is active per allowed_ips mapping, skip.
-            if peer_key not in inactive_peers:
+                continue  # Skip peers without a remote endpoint.
+            # If the peer is active, skip it.
+            if peer_key in discovery_peers:
                 continue
 
             new_endpoint = None
@@ -300,8 +308,12 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
                 try:
                     wg_set_peer_endpoint(wg_interface, peer_key, new_endpoint, use_sudo)
                     logging.info("Updated peer %s endpoint from %s to %s", peer_key, old_endpoint, new_endpoint)
+                    updated_count += 1
                 except Exception as e:
                     logging.error("Failed to update peer %s (old: %s, new: %s): %s", peer_key, old_endpoint, new_endpoint, e)
+
+        logging.info("Auto-discovery statistics: total peers: %d, active: %d, inactive: %d, discovery peers: %d, updated: %d",
+                     total_peers, active_count, inactive_count, len(discovery_peers), updated_count)
         time.sleep(discovery_interval)
 
 
