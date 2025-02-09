@@ -16,6 +16,7 @@ Simple dynamic WireGuard endpoint service.
     3. For peers that are inactive, queries active discovery peers (using their GET /v1/endpoints response)
        for updated endpoint information, and
     4. Updates the local configuration if a new endpoint is found.
+       The log will show both the previous and new endpoint values.
 
 Intended to run as a systemd service on Linux (adaptable to macOS via launchd).
 
@@ -237,6 +238,7 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
     3. For each inactive peer, loop through all active discovery peers (based on the allowed IPs mapping)
        and send an HTTP GET to their /v1/endpoints endpoint.
     4. If a discovery peer returns a non-null endpoint for the inactive peer, update the local configuration.
+       Log both the previous and new endpoint values.
     """
     while True:
         logging.info("Auto-discovery loop starting iteration...")
@@ -259,8 +261,7 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
                 logging.debug("Peer %s at %s is inactive: %s", peer_key, allowed_ip, e)
                 inactive_peers[peer_key] = allowed_ip
 
-        # For each inactive peer, query discovery peers for an updated endpoint.
-        for peer_key in inactive_peers:
+        for peer_key, old_endpoint in inactive_peers.items():
             new_endpoint = None
             for disc_key, disc_allowed_ip in allowed_ips_map.items():
                 if disc_key == peer_key:
@@ -276,12 +277,12 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
                                 break
                 except Exception as e:
                     logging.debug("Error querying discovery node %s: %s", disc_key, e)
-            if new_endpoint and new_endpoint != inactive_peers[peer_key]:
+            if new_endpoint and new_endpoint != old_endpoint:
                 try:
                     wg_set_peer_endpoint(wg_interface, peer_key, new_endpoint, use_sudo)
-                    logging.info("Updated peer %s endpoint to %s", peer_key, new_endpoint)
+                    logging.info("Updated peer %s endpoint from %s to %s", peer_key, old_endpoint, new_endpoint)
                 except Exception as e:
-                    logging.error("Failed to update peer %s: %s", peer_key, e)
+                    logging.error("Failed to update peer %s (old: %s, new: %s): %s", peer_key, old_endpoint, new_endpoint, e)
         time.sleep(discovery_interval)
 
 
