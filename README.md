@@ -1,21 +1,23 @@
 # wg-discovery
 
-`wg-discovery` is a lightweight, peer-to-peer tool for WireGuard that automates 
-the discovery and management of peer endpoints. It runs as an HTTP service, 
-providing a JSON API to:
+`wg-discovery` is a lightweight tool/service for WireGuard that automates the 
+discovery and management of peer-to-peer endpoints. It runs as an HTTP 
+service, providing a JSON API to:
 
-- **Expose Current Endpoints:**  
-  Retrieve a list of active peer endpoints via a GET request.
+- Expose a list of reachable peers via a GET request over the WireGuard 
+  interface.
 
-- **Dynamically Update Endpoints:**  
-  Allow peers to update their endpoint information via a POST request.
+- Allows the peer to dynamically configure their endpoint information from 
+  remote peers in the network
 
-- **Security:**  
-  Enforce source IP filtering and optionally drop privileges after binding the 
-  listening socket.
+`wg-discovery` is designed to work in decentralized WireGuard setups — helping 
+peers to detect one another’s direct connection details automatically without 
+relying on a central servers to forward traffic. Only connection end point 
+details are provided to peers through other nodes in the WireGuard network.
 
-wg-discovery is designed to work in decentralized WireGuard setups—helping peers 
-update one another’s connection details automatically without relying on a central server.
+It is intended to be run on the internal WireGuard network and secured by 
+WireGuard's own security layers. It is **NOT** intended to be exposed as a 
+publicly available HTTP service.
 
 ## Sudo Access
 
