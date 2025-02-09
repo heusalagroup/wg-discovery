@@ -14,7 +14,7 @@ Simple dynamic WireGuard endpoint service.
     1. Retrieves the current remote endpoints using 'wg show <interface> endpoints',
     2. Retrieves each peer’s internal WireGuard IP via 'wg show <interface> allowed-ips',
     3. Pings each peer via HTTP GET /v1/endpoints on its allowed IP,
-    4. For inactive peers, queries discovery peers (using their GET /v1/endpoints response)
+    4. For inactive peers, queries active discovery peers (using their GET /v1/endpoints response)
        for updated endpoint information, and
     5. If a discovery peer returns a non-null endpoint that differs from the current remote endpoint,
        updates the local configuration and logs both the previous and new endpoint values.
@@ -232,7 +232,7 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
     """
     Periodically check local peers for activity and update endpoints for inactive peers.
 
-    1. Retrieve the remote endpoints using 'wg show <interface> endpoints'.
+    1. Retrieve the current remote endpoints using 'wg show <interface> endpoints'.
     2. Retrieve the allowed IPs mapping using 'wg show <interface> allowed-ips' to obtain each peer's internal WG IP.
     3. For each peer, attempt to connect to its discovery service at:
          http://<allowed_ip>:<local_port>/v1/endpoints
@@ -271,9 +271,15 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
                 logging.debug("Peer %s at allowed IP %s is inactive: %s", peer_key, allowed_ip, e)
                 inactive_peers[peer_key] = allowed_ip
 
-        # For each inactive peer, use discovery peers to find an updated endpoint.
-        for peer_key in inactive_peers:
-            old_endpoint = remote_endpoints.get(peer_key)
+        # For each inactive peer, query discovery peers for an updated endpoint.
+        for peer_key, old_endpoint in remote_endpoints.items():
+            # Skip if the remote endpoint is None (peer not configured)
+            if old_endpoint is None:
+                continue
+            # If the peer is active per allowed_ips mapping, skip.
+            if peer_key not in inactive_peers:
+                continue
+
             new_endpoint = None
             for disc_key, disc_allowed_ip in allowed_ips_map.items():
                 if disc_key == peer_key:
@@ -285,7 +291,8 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
                             disc_data = json.loads(disc_response.read().decode("utf-8"))
                             if peer_key in disc_data and disc_data[peer_key]:
                                 new_endpoint = disc_data[peer_key]
-                                logging.info("Found updated endpoint for peer %s from discovery node %s: %s", peer_key, disc_key, new_endpoint)
+                                logging.info("Found updated endpoint for peer %s from discovery node %s: old: %s, new: %s",
+                                             peer_key, disc_key, old_endpoint, new_endpoint)
                                 break
                 except Exception as e:
                     logging.debug("Error querying discovery node %s: %s", disc_key, e)
