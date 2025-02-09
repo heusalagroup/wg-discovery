@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple dynamic WireGuard endpoint service.
+Simple dynamic WireGuard endpoint discovery service.
 
 - Exposes current endpoint data via GET /v1/endpoints.
 - Uses source IP filtering to restrict access (if provided).
@@ -244,7 +244,7 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
     Additionally, log statistics at the end of each iteration.
     """
     while True:
-        logging.info("Auto-discovery loop starting iteration...")
+        logging.debug("Auto-discovery loop starting iteration...")
         try:
             remote_endpoints = wg_show_endpoints(wg_interface, use_sudo)
         except Exception as e:
@@ -324,7 +324,7 @@ def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, dr
                             allowed_ips=allowed_ips,
                             use_sudo=use_sudo)
     with socketserver.TCPServer((bind_ip, port), handler_class) as httpd:
-        logging.info("Starting WG endpoint service on http://%s:%d/", bind_ip, port)
+        logging.info("Starting WG endpoint discovery service on http://%s:%d/", bind_ip, port)
         if drop_user:
             try:
                 drop_privileges(drop_user, drop_group)
@@ -335,11 +335,11 @@ def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, dr
             thread = threading.Thread(target=auto_discovery_loop, args=(wg_interface, port, use_sudo, discovery_interval))
             thread.daemon = True
             thread.start()
-            logging.info("Auto-discovery thread started.")
+            logging.debug("Auto-discovery thread started.")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
-            logging.info("Shutting down WG endpoint service")
+            logging.info("Shutting down WG endpoint discovery service")
             httpd.server_close()
 
 
