@@ -1,0 +1,24 @@
+[Unit]
+Description=WireGuard Endpoint Discovery Service
+After=network.target wg-quick@wg0.service
+Requires=wg-quick@wg0.service
+
+[Service]
+ExecStart=/usr/bin/env python3 /opt/wg/wg-discovery.py \
+    --wg-interface wg0 \
+    --auto-discovery \
+    --discovery-interval 60 \
+    --cache-freshness 15 \
+    --cache-wait-timeout 30 \
+    --max-workers 10 \
+    --max-retries 1 \
+    --log-level INFO \
+    --user wg-discovery
+Restart=always
+User=wg-discovery
+Group=nogroup
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

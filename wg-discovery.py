@@ -473,6 +473,7 @@ def run_server(bind_ip, local_port, wg_interface, allowed_ips, use_sudo, drop_us
             logging.info("Shutting down WG endpoint discovery service")
             httpd.server_close()
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Dynamic WireGuard endpoint service')
     parser.add_argument('--wg-interface', default='wg0', help='Name of the WireGuard interface (default: wg0)')
