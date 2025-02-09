@@ -26,7 +26,8 @@ Intended to run as a systemd service on Linux (adaptable to macOS via launchd).
 Usage example:
     sudo python3 wg_endpoint_service.py --wg-interface wg0 --port 51820 \
       --allowed-ips 10.220.0.19,10.220.0.25 --use-sudo --user nobody --group nogroup \
-      --auto-discovery --discovery-interval 60 --cache-freshness 15 --cache-wait-timeout 30 --log-level DEBUG
+      --auto-discovery --discovery-interval 60 --max-workers 10 \
+      --cache-freshness 15 --cache-wait-timeout 30 --log-level DEBUG
 """
 
 import http.server
@@ -59,8 +60,8 @@ cache_update_event = threading.Event()
 cache_updated_event = threading.Event()
 
 # Configurable thresholds.
-CACHE_FRESHNESS_THRESHOLD = 15  # seconds
-CACHE_WAIT_TIMEOUT = 30         # seconds
+CACHE_FRESHNESS_THRESHOLD = 15  # seconds: cache is fresh if updated within this many seconds.
+CACHE_WAIT_TIMEOUT = 30         # seconds: maximum time to wait for a cache update.
 
 
 def get_interface_ip(ifname):
@@ -302,7 +303,7 @@ def query_peer_data(url):
     return None
 
 
-def run_auto_discovery(wg_interface, local_port, use_sudo, discovery_interval):
+def run_auto_discovery(wg_interface, local_port, use_sudo, discovery_interval, max_workers):
     """
     Event-driven auto-discovery: perform one iteration of the auto-discovery process,
     then reschedule itself using a Timer so that iterations occur approximately every discovery_interval seconds.
@@ -318,15 +319,19 @@ def run_auto_discovery(wg_interface, local_port, use_sudo, discovery_interval):
     try:
         remote_endpoints = wg_show_endpoints(wg_interface, use_sudo)
     except Exception as e:
-        logging.error("Auto-discovery iteration failed to get remote endpoints: %s", e)
-        Timer(discovery_interval, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval)).start()
+        elapsed = time.time() - start_time
+        logging.error("Auto-discovery iteration failed to get remote endpoints (completed in %.2f s): %s", elapsed, e)
+        next_run = max(0, discovery_interval - elapsed)
+        Timer(next_run, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval, max_workers)).start()
         return
 
     try:
         allowed_ips_map = wg_show_allowed_ips(wg_interface, use_sudo)
     except Exception as e:
-        logging.error("Auto-discovery iteration failed to get allowed IPs: %s", e)
-        Timer(discovery_interval, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval)).start()
+        elapsed = time.time() - start_time
+        logging.error("Auto-discovery iteration failed to get allowed IPs (completed in %.2f s): %s", elapsed, e)
+        next_run = max(0, discovery_interval - elapsed)
+        Timer(next_run, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval, max_workers)).start()
         return
 
     total_peers = len(allowed_ips_map)
@@ -335,8 +340,8 @@ def run_auto_discovery(wg_interface, local_port, use_sudo, discovery_interval):
     updated_count = 0
     discovery_peers = {}
 
-    # Use a ThreadPoolExecutor to query peers in parallel.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    # Use ThreadPoolExecutor to query peers in parallel.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(query_peer, peer_key, allowed_ip, local_port): peer_key
                    for peer_key, allowed_ip in allowed_ips_map.items()}
         for future in concurrent.futures.as_completed(futures):
@@ -355,13 +360,9 @@ def run_auto_discovery(wg_interface, local_port, use_sudo, discovery_interval):
         if peer_key in discovery_peers:
             continue  # Skip active peers.
         new_endpoint = None
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {}
-            for disc_key, disc_allowed_ip in allowed_ips_map.items():
-                if disc_key == peer_key:
-                    continue
-                url = f"http://{disc_allowed_ip}:{local_port}/v1/endpoints"
-                futures[executor.submit(query_peer_data, url)] = disc_key
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(query_peer_data, f"http://{disc_allowed_ip}:{local_port}/v1/endpoints"): disc_key
+                       for disc_key, disc_allowed_ip in allowed_ips_map.items() if disc_key != peer_key}
             for future in concurrent.futures.as_completed(futures):
                 disc_key = futures[future]
                 try:
@@ -384,15 +385,14 @@ def run_auto_discovery(wg_interface, local_port, use_sudo, discovery_interval):
                 logging.error("Failed to update peer %s (old: %s, new: %s): %s", peer_key, old_endpoint, new_endpoint, e)
 
     elapsed = time.time() - start_time
-    logging.info("Auto-discovery iteration completed in %.2f seconds", elapsed)
-    logging.info("Auto-discovery statistics: total peers: %d, active: %d, inactive: %d, discovery peers: %d, updated: %d",
-                 total_peers, active_count, inactive_count, len(discovery_peers), updated_count)
+    logging.info("Auto-discovery statistics: total peers: %d, active: %d, inactive: %d, discovery peers: %d, updated: %d, completed in: %.2f s",
+                 total_peers, active_count, inactive_count, len(discovery_peers), updated_count, elapsed)
     next_run = max(0, discovery_interval - elapsed)
-    Timer(next_run, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval)).start()
+    Timer(next_run, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval, max_workers)).start()
 
 
 def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group,
-               auto_discovery, discovery_interval):
+               auto_discovery, discovery_interval, max_workers):
     handler_class = partial(WGEndpointHandler,
                             wg_interface=wg_interface,
                             allowed_ips=allowed_ips,
@@ -411,7 +411,7 @@ def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, dr
         cache_thread.start()
         logging.debug("Cache update worker thread started.")
         if auto_discovery:
-            run_auto_discovery(wg_interface, port, use_sudo, discovery_interval)
+            run_auto_discovery(wg_interface, port, use_sudo, discovery_interval, max_workers)
             logging.debug("Auto-discovery process started.")
         try:
             httpd.serve_forever()
@@ -438,6 +438,8 @@ def parse_args():
                         help='Cache is considered fresh if updated within this many seconds (default: 15)')
     parser.add_argument('--cache-wait-timeout', type=int, default=30,
                         help='Maximum time (in seconds) to wait for a cache update (default: 30)')
+    parser.add_argument('--max-workers', type=int, default=10,
+                        help='Maximum number of worker threads for parallel queries (default: 10)')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='Set the logging level (default: INFO)')
     return parser.parse_args()
@@ -473,12 +475,13 @@ def main():
     drop_group = args.group if args.group != "" else None
     auto_discovery = args.auto_discovery
     discovery_interval = args.discovery_interval
+    max_workers = args.max_workers
 
-    logging.info("Configuration: wg_interface=%s, bind_ip=%s, port=%d, allowed_ips=%s, use_sudo=%s, auto_discovery=%s, discovery_interval=%d, cache_freshness=%d, cache_wait_timeout=%d, user=%s, group=%s",
+    logging.info("Configuration: wg_interface=%s, bind_ip=%s, port=%d, allowed_ips=%s, use_sudo=%s, auto_discovery=%s, discovery_interval=%d, cache_freshness=%d, cache_wait_timeout=%d, max_workers=%d, user=%s, group=%s",
                  wg_interface, bind_ip, port, allowed_ips, use_sudo, auto_discovery,
-                 discovery_interval, args.cache_freshness, args.cache_wait_timeout, drop_user, drop_group)
+                 discovery_interval, args.cache_freshness, args.cache_wait_timeout, max_workers, drop_user, drop_group)
     run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group,
-               auto_discovery, discovery_interval)
+               auto_discovery, discovery_interval, max_workers)
 
 
 if __name__ == "__main__":
