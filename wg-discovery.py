@@ -10,7 +10,7 @@ Simple dynamic WireGuard endpoint discovery service.
 - Automatically adds the bind IP to the allowed source IPs.
 - Returns responses and error messages in JSON format.
 - Optionally drops privileges to a specified user and group.
-- Optionally runs an auto‑discovery thread that:
+- Optionally runs an auto‑discovery process that:
     1. Retrieves the current remote endpoints using 'wg show <interface> endpoints',
     2. Retrieves each peer’s internal WireGuard IP via 'wg show <interface> allowed-ips',
     3. Pings each peer via HTTP GET /v1/endpoints on its allowed IP,
@@ -18,13 +18,15 @@ Simple dynamic WireGuard endpoint discovery service.
        for updated endpoint information, and
     5. If a discovery peer returns a non-null endpoint that differs from the current remote endpoint,
        updates the local configuration and logs both the previous and new endpoint values.
+- The GET request for /v1/endpoints returns cached data if it is fresh (less than --cache-freshness seconds old);
+  otherwise, it triggers an on-demand cache update and waits (up to --cache-wait-timeout seconds) for fresh data.
 
 Intended to run as a systemd service on Linux (adaptable to macOS via launchd).
 
 Usage example:
     sudo python3 wg_endpoint_service.py --wg-interface wg0 --port 51820 \
       --allowed-ips 10.220.0.19,10.220.0.25 --use-sudo --user nobody --group nogroup \
-      --auto-discovery --discovery-interval 60 --log-level DEBUG
+      --auto-discovery --discovery-interval 60 --cache-freshness 15 --cache-wait-timeout 30 --log-level DEBUG
 """
 
 import http.server
@@ -46,6 +48,19 @@ from functools import partial
 import threading
 import time
 import urllib.request
+from threading import Timer
+import concurrent.futures
+
+# Global cache variables and events.
+cached_endpoints = {}
+last_cache_update_time = 0
+cache_lock = threading.Lock()
+cache_update_event = threading.Event()
+cache_updated_event = threading.Event()
+
+# Configurable thresholds.
+CACHE_FRESHNESS_THRESHOLD = 15  # seconds
+CACHE_WAIT_TIMEOUT = 30         # seconds
 
 
 def get_interface_ip(ifname):
@@ -180,7 +195,35 @@ def wg_set_peer_endpoint(wg_interface, peer_key, new_endpoint, use_sudo=False):
     subprocess.run(cmd, check=True)
 
 
+def cache_update_worker(wg_interface, use_sudo):
+    """
+    Background worker that waits for an event trigger to update the cache.
+    When triggered by a GET request, it updates the global cached_endpoints and last_cache_update_time,
+    then signals that fresh data is available.
+    """
+    global cached_endpoints, last_cache_update_time
+    while True:
+        cache_update_event.wait()
+        try:
+            endpoints = wg_show_endpoints(wg_interface, use_sudo)
+            with cache_lock:
+                cached_endpoints = endpoints
+                last_cache_update_time = time.time()
+            cache_updated_event.set()
+            logging.debug("Cache updated on demand: %s", endpoints)
+        except Exception as e:
+            logging.error("Failed to update endpoints cache on demand: %s", e)
+            cache_updated_event.set()
+        finally:
+            cache_update_event.clear()
+
+
 class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
+    """
+    GET /v1/endpoints returns cached remote endpoint information.
+    If the cache is older than --cache-freshness seconds, the request triggers a cache update
+    and waits (up to --cache-wait-timeout seconds) for fresh data.
+    """
 
     def __init__(self, *args, wg_interface, allowed_ips, use_sudo, **kwargs):
         self.wg_interface = wg_interface
@@ -189,9 +232,6 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def _send_json_response(self, code, data):
-        """
-        Send an HTTP response with the given status code and JSON data.
-        """
         response = json.dumps(data)
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -214,13 +254,23 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         # GET /v1/endpoints returns remote endpoint information.
         if parsed.path == "/v1/endpoints":
-            try:
-                parsed_output = wg_show_endpoints(self.wg_interface, self.use_sudo)
-                self._send_json_response(200, parsed_output)
-            except subprocess.CalledProcessError as e:
-                error_message = {"error": "Internal Server Error", "message": e.stderr}
-                logging.error("Error running wg show endpoints: %s", e.stderr)
-                self._send_json_response(500, error_message)
+            with cache_lock:
+                age = time.time() - last_cache_update_time
+            if age < CACHE_FRESHNESS_THRESHOLD:
+                with cache_lock:
+                    current_cache = dict(cached_endpoints)
+                self._send_json_response(200, current_cache)
+            else:
+                # Trigger cache update and wait for fresh data.
+                cache_update_event.set()
+                if not cache_updated_event.wait(timeout=CACHE_WAIT_TIMEOUT):
+                    self._send_json_response(500, {"error": "Cache update timeout"})
+                    return
+                else:
+                    cache_updated_event.clear()
+                    with cache_lock:
+                        current_cache = dict(cached_endpoints)
+                    self._send_json_response(200, current_cache)
         else:
             self._send_json_response(404, {"error": "Not Found"})
 
@@ -228,96 +278,117 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         logging.info("%s - %s", self.address_string(), format % args)
 
 
-def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
+def query_peer(peer_key, allowed_ip, local_port):
     """
-    Periodically check local peers for activity and update endpoints for inactive peers.
+    Query a peer's /v1/endpoints URL.
+    Returns a tuple: (peer_key, allowed_ip, success flag, error message).
+    """
+    url = f"http://{allowed_ip}:{local_port}/v1/endpoints"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            if response.status == 200:
+                return (peer_key, allowed_ip, True, "")
+    except Exception as e:
+        return (peer_key, allowed_ip, False, str(e))
 
-    1. Retrieve the current remote endpoints using 'wg show <interface> endpoints'.
-    2. Retrieve the allowed IPs mapping using 'wg show <interface> allowed-ips' to obtain each peer's internal WG IP.
-    3. For each peer, attempt to connect to its discovery service at:
-         http://<allowed_ip>:<local_port>/v1/endpoints
-       If the peer is unreachable, consider it inactive.
-    4. For each inactive peer, loop through all active discovery peers (from the allowed IPs mapping)
-       and send an HTTP GET to their /v1/endpoints endpoint.
-    5. If a discovery peer returns a non-null endpoint for the inactive peer that differs from the current remote endpoint,
+
+def query_peer_data(url):
+    """
+    Query a given URL and return JSON data.
+    """
+    with urllib.request.urlopen(url, timeout=5) as response:
+        if response.status == 200:
+            return json.loads(response.read().decode("utf-8"))
+    return None
+
+
+def run_auto_discovery(wg_interface, local_port, use_sudo, discovery_interval):
+    """
+    Event-driven auto-discovery: perform one iteration of the auto-discovery process,
+    then reschedule itself using a Timer so that iterations occur approximately every discovery_interval seconds.
+    1. Retrieve the current remote endpoints.
+    2. Retrieve the allowed IPs mapping.
+    3. In parallel, ping each peer using its allowed IP.
+    4. For each inactive peer, in parallel query discovery peers for updated endpoints.
+    5. If an updated endpoint is found (and differs from the current remote endpoint),
        update the local configuration and log the change (showing both the previous and new endpoints).
-    Additionally, log statistics at the end of each iteration.
+    6. Log statistics and schedule the next run.
     """
-    while True:
-        logging.debug("Auto-discovery loop starting iteration...")
-        try:
-            remote_endpoints = wg_show_endpoints(wg_interface, use_sudo)
-        except Exception as e:
-            logging.error("Failed to get remote endpoints: %s", e)
-            time.sleep(discovery_interval)
-            continue
+    start_time = time.time()
+    try:
+        remote_endpoints = wg_show_endpoints(wg_interface, use_sudo)
+    except Exception as e:
+        logging.error("Auto-discovery iteration failed to get remote endpoints: %s", e)
+        Timer(discovery_interval, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval)).start()
+        return
 
-        try:
-            allowed_ips_map = wg_show_allowed_ips(wg_interface, use_sudo)
-        except Exception as e:
-            logging.error("Failed to get allowed IPs: %s", e)
-            time.sleep(discovery_interval)
-            continue
+    try:
+        allowed_ips_map = wg_show_allowed_ips(wg_interface, use_sudo)
+    except Exception as e:
+        logging.error("Auto-discovery iteration failed to get allowed IPs: %s", e)
+        Timer(discovery_interval, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval)).start()
+        return
 
-        total_peers = len(allowed_ips_map)
-        active_count = 0
-        inactive_count = 0
-        updated_count = 0
-        discovery_peers = {}
+    total_peers = len(allowed_ips_map)
+    active_count = 0
+    inactive_count = 0
+    updated_count = 0
+    discovery_peers = {}
 
-        # Ping each peer using its allowed IP.
-        for peer_key, allowed_ip in allowed_ips_map.items():
-            url = f"http://{allowed_ip}:{local_port}/v1/endpoints"
-            try:
-                with urllib.request.urlopen(url, timeout=5) as response:
-                    if response.status == 200:
-                        logging.debug("%s %s: active", peer_key, allowed_ip)
-                        active_count += 1
-                        discovery_peers[peer_key] = allowed_ip
-                        continue
-            except Exception as e:
-                logging.debug("%s %s: inactive: %s", peer_key, allowed_ip, e)
+    # Use a ThreadPoolExecutor to query peers in parallel.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(query_peer, peer_key, allowed_ip, local_port): peer_key
+                   for peer_key, allowed_ip in allowed_ips_map.items()}
+        for future in concurrent.futures.as_completed(futures):
+            peer_key, allowed_ip, success, err = future.result()
+            if success:
+                active_count += 1
+                discovery_peers[peer_key] = allowed_ip
+            else:
                 inactive_count += 1
 
-        # For each inactive peer, query discovery peers for an updated endpoint.
-        for peer_key in remote_endpoints:
-            old_endpoint = remote_endpoints.get(peer_key)
-            if old_endpoint is None:
-                continue  # Skip peers without a remote endpoint.
-            # Only consider peers that are inactive.
-            if peer_key in discovery_peers:
-                continue
-
-            new_endpoint = None
+    # For each inactive peer, query discovery peers in parallel.
+    for peer_key in remote_endpoints:
+        old_endpoint = remote_endpoints.get(peer_key)
+        if old_endpoint is None:
+            continue
+        if peer_key in discovery_peers:
+            continue  # Skip active peers.
+        new_endpoint = None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {}
             for disc_key, disc_allowed_ip in allowed_ips_map.items():
                 if disc_key == peer_key:
                     continue
-                disc_url = f"http://{disc_allowed_ip}:{local_port}/v1/endpoints"
+                url = f"http://{disc_allowed_ip}:{local_port}/v1/endpoints"
+                futures[executor.submit(query_peer_data, url)] = disc_key
+            for future in concurrent.futures.as_completed(futures):
+                disc_key = futures[future]
                 try:
-                    with urllib.request.urlopen(disc_url, timeout=5) as disc_response:
-                        if disc_response.status == 200:
-                            disc_data = json.loads(disc_response.read().decode("utf-8"))
-                            if peer_key in disc_data and disc_data[peer_key]:
-                                candidate = disc_data[peer_key]
-                                # Only consider it updated if it's different from the current remote endpoint.
-                                if candidate != old_endpoint:
-                                    new_endpoint = candidate
-                                    logging.info("Found updated endpoint for peer %s from discovery node %s: old: %s, new: %s",
-                                                 peer_key, disc_key, old_endpoint, new_endpoint)
-                                    break
+                    disc_data = future.result()
+                    if disc_data and peer_key in disc_data and disc_data[peer_key]:
+                        candidate = disc_data[peer_key]
+                        if candidate != old_endpoint:
+                            new_endpoint = candidate
+                            logging.info("Found updated endpoint for peer %s from discovery node %s: old: %s, new: %s",
+                                         peer_key, disc_key, old_endpoint, new_endpoint)
+                            break
                 except Exception as e:
                     logging.debug("Error querying discovery node %s: %s", disc_key, e)
-            if new_endpoint and new_endpoint != old_endpoint:
-                try:
-                    wg_set_peer_endpoint(wg_interface, peer_key, new_endpoint, use_sudo)
-                    logging.info("Updated peer %s endpoint from %s to %s", peer_key, old_endpoint, new_endpoint)
-                    updated_count += 1
-                except Exception as e:
-                    logging.error("Failed to update peer %s (old: %s, new: %s): %s", peer_key, old_endpoint, new_endpoint, e)
+        if new_endpoint and new_endpoint != old_endpoint:
+            try:
+                wg_set_peer_endpoint(wg_interface, peer_key, new_endpoint, use_sudo)
+                logging.info("Updated peer %s endpoint from %s to %s", peer_key, old_endpoint, new_endpoint)
+                updated_count += 1
+            except Exception as e:
+                logging.error("Failed to update peer %s (old: %s, new: %s): %s", peer_key, old_endpoint, new_endpoint, e)
 
-        logging.info("Auto-discovery statistics: total peers: %d, active: %d, inactive: %d, discovery peers: %d, updated: %d",
-                     total_peers, active_count, inactive_count, len(discovery_peers), updated_count)
-        time.sleep(discovery_interval)
+    elapsed = time.time() - start_time
+    logging.info("Auto-discovery iteration completed in %.2f seconds", elapsed)
+    logging.info("Auto-discovery statistics: total peers: %d, active: %d, inactive: %d, discovery peers: %d, updated: %d",
+                 total_peers, active_count, inactive_count, len(discovery_peers), updated_count)
+    next_run = max(0, discovery_interval - elapsed)
+    Timer(next_run, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval)).start()
 
 
 def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group,
@@ -334,11 +405,14 @@ def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, dr
             except Exception as e:
                 logging.error("Failed to drop privileges: %s", e)
                 sys.exit(1)
+        # Start the cache update worker thread (event-driven).
+        cache_thread = threading.Thread(target=cache_update_worker, args=(wg_interface, use_sudo))
+        cache_thread.daemon = True
+        cache_thread.start()
+        logging.debug("Cache update worker thread started.")
         if auto_discovery:
-            thread = threading.Thread(target=auto_discovery_loop, args=(wg_interface, port, use_sudo, discovery_interval))
-            thread.daemon = True
-            thread.start()
-            logging.debug("Auto-discovery thread started.")
+            run_auto_discovery(wg_interface, port, use_sudo, discovery_interval)
+            logging.debug("Auto-discovery process started.")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
@@ -359,7 +433,11 @@ def parse_args():
     parser.add_argument('--group', default='', help='Groupname to drop privileges to (optional; defaults to user\'s primary group if not specified)')
     parser.add_argument('--auto-discovery', action='store_true', help='Enable auto-discovery of peer endpoints (default: disabled)')
     parser.add_argument('--discovery-interval', type=int, default=60,
-                        help='Interval (in seconds) between auto-discovery checks (default: 60)')
+                        help='Interval (in seconds) between auto-discovery runs (default: 60)')
+    parser.add_argument('--cache-freshness', type=int, default=15,
+                        help='Cache is considered fresh if updated within this many seconds (default: 15)')
+    parser.add_argument('--cache-wait-timeout', type=int, default=30,
+                        help='Maximum time (in seconds) to wait for a cache update (default: 30)')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='Set the logging level (default: INFO)')
     return parser.parse_args()
@@ -371,6 +449,10 @@ def main():
     if not isinstance(numeric_level, int):
         raise ValueError("Invalid log level: %s" % args.log_level)
     logging.basicConfig(level=numeric_level, format='%(asctime)s %(levelname)s: %(message)s')
+
+    global CACHE_FRESHNESS_THRESHOLD, CACHE_WAIT_TIMEOUT
+    CACHE_FRESHNESS_THRESHOLD = args.cache_freshness
+    CACHE_WAIT_TIMEOUT = args.cache_wait_timeout
 
     wg_interface = args.wg_interface
 
@@ -392,8 +474,9 @@ def main():
     auto_discovery = args.auto_discovery
     discovery_interval = args.discovery_interval
 
-    logging.info("Configuration: wg_interface=%s, bind_ip=%s, port=%d, allowed_ips=%s, use_sudo=%s, auto_discovery=%s, discovery_interval=%d, user=%s, group=%s",
-                 wg_interface, bind_ip, port, allowed_ips, use_sudo, auto_discovery, discovery_interval, drop_user, drop_group)
+    logging.info("Configuration: wg_interface=%s, bind_ip=%s, port=%d, allowed_ips=%s, use_sudo=%s, auto_discovery=%s, discovery_interval=%d, cache_freshness=%d, cache_wait_timeout=%d, user=%s, group=%s",
+                 wg_interface, bind_ip, port, allowed_ips, use_sudo, auto_discovery,
+                 discovery_interval, args.cache_freshness, args.cache_wait_timeout, drop_user, drop_group)
     run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group,
                auto_discovery, discovery_interval)
 
