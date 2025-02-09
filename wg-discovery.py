@@ -442,8 +442,12 @@ def run_auto_discovery(wg_interface, local_port, use_sudo, discovery_interval, m
                 logging.error("Failed to update peer %s: %s", peer_key, e)
 
     elapsed = time.time() - start_time
-    logging.info("Auto-discovery completed in %.2f seconds: total peers=%d, reachable=%d, discovery peers=%d, inactive=%d",
-                 elapsed, total_peers, len(reachable_peers), len(discovery_peers), len(inactive_peers))
+
+    # Log the inactive peer keys
+    inactive_peer_keys = list(inactive_peers.keys())
+    logging.info("Auto-discovery completed in %.2f seconds: total peers=%d, reachable=%d, discovery peers=%d, inactive=%d (%s)",
+                 elapsed, total_peers, len(reachable_peers), len(discovery_peers), len(inactive_peers),
+                 ", ".join(inactive_peer_keys) if inactive_peer_keys else "None")
 
     # Schedule next discovery
     Timer(discovery_interval, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval, max_workers, max_retries)).start()
