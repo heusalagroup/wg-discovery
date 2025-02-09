@@ -284,7 +284,7 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
             old_endpoint = remote_endpoints.get(peer_key)
             if old_endpoint is None:
                 continue  # Skip peers without a remote endpoint.
-            # If the peer is active, skip it.
+            # Only consider peers that are inactive.
             if peer_key in discovery_peers:
                 continue
 
@@ -298,10 +298,13 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
                         if disc_response.status == 200:
                             disc_data = json.loads(disc_response.read().decode("utf-8"))
                             if peer_key in disc_data and disc_data[peer_key]:
-                                new_endpoint = disc_data[peer_key]
-                                logging.info("Found updated endpoint for peer %s from discovery node %s: old: %s, new: %s",
-                                             peer_key, disc_key, old_endpoint, new_endpoint)
-                                break
+                                candidate = disc_data[peer_key]
+                                # Only consider it updated if it's different from the current remote endpoint.
+                                if candidate != old_endpoint:
+                                    new_endpoint = candidate
+                                    logging.info("Found updated endpoint for peer %s from discovery node %s: old: %s, new: %s",
+                                                 peer_key, disc_key, old_endpoint, new_endpoint)
+                                    break
                 except Exception as e:
                     logging.debug("Error querying discovery node %s: %s", disc_key, e)
             if new_endpoint and new_endpoint != old_endpoint:
