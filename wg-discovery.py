@@ -26,7 +26,7 @@ Intended to run as a systemd service on Linux (adaptable to macOS via launchd).
 Usage example:
     sudo python3 wg_endpoint_service.py --wg-interface wg0 --port 51820 \
       --allowed-ips 10.220.0.19,10.220.0.25 --use-sudo --user nobody --group nogroup \
-      --auto-discovery --discovery-interval 60 --max-workers 10 \
+      --auto-discovery --discovery-interval 60 --max-workers 10 --max-retries 1 \
       --cache-freshness 15 --cache-wait-timeout 30 --log-level DEBUG
 """
 
@@ -279,120 +279,112 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         logging.info("%s - %s", self.address_string(), format % args)
 
 
-def query_peer(peer_key, allowed_ip, local_port):
+def query_peer(peer_key, allowed_ip, local_port, max_retries=1):
     """
     Query a peer's /v1/endpoints URL.
     Returns a tuple: (peer_key, allowed_ip, success flag, error message).
     """
     url = f"http://{allowed_ip}:{local_port}/v1/endpoints"
-    try:
-        with urllib.request.urlopen(url, timeout=5) as response:
-            if response.status == 200:
-                return (peer_key, allowed_ip, True, "")
-    except Exception as e:
-        return (peer_key, allowed_ip, False, str(e))
+    last_error = ""
+    for i in range(max_retries):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                if response.status == 200:
+                    return (peer_key, allowed_ip, True, "")
+        except Exception as e:
+            last_error = str(e)
+    return (peer_key, allowed_ip, False, last_error)
 
 
-def query_peer_data(url):
+def query_peer_data(url, max_retries=1):
     """
     Query a given URL and return JSON data.
     """
-    with urllib.request.urlopen(url, timeout=5) as response:
-        if response.status == 200:
-            return json.loads(response.read().decode("utf-8"))
+    last_error = ""
+    for i in range(max_retries):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                if response.status == 200:
+                    return json.loads(response.read().decode("utf-8"))
+        except Exception as e:
+            last_error = str(e)
     return None
 
 
-def run_auto_discovery(wg_interface, local_port, use_sudo, discovery_interval, max_workers):
+def run_auto_discovery(wg_interface, local_port, use_sudo, discovery_interval, max_workers, max_retries):
     """
-    Event-driven auto-discovery: perform one iteration of the auto-discovery process,
-    then reschedule itself using a Timer so that iterations occur approximately every discovery_interval seconds.
-    1. Retrieve the current remote endpoints.
-    2. Retrieve the allowed IPs mapping.
-    3. In parallel, ping each peer using its allowed IP.
-    4. For each inactive peer, in parallel query discovery peers for updated endpoints.
-    5. If an updated endpoint is found (and differs from the current remote endpoint),
-       update the local configuration and log the change (showing both the previous and new endpoints).
-    6. Log statistics and schedule the next run.
+    Optimized auto-discovery process:
+    1. Detect active peers.
+    2. Identify a subset of active discovery peers (not all active peers are discovery peers).
+    3. Use discovery peers to find updated endpoints for inactive peers.
     """
     start_time = time.time()
-    try:
-        remote_endpoints = wg_show_endpoints(wg_interface, use_sudo)
-    except Exception as e:
-        elapsed = time.time() - start_time
-        logging.error("Auto-discovery iteration failed to get remote endpoints (completed in %.2f s): %s", elapsed, e)
-        next_run = max(0, discovery_interval - elapsed)
-        Timer(next_run, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval, max_workers)).start()
-        return
 
     try:
+        remote_endpoints = wg_show_endpoints(wg_interface, use_sudo)
         allowed_ips_map = wg_show_allowed_ips(wg_interface, use_sudo)
     except Exception as e:
-        elapsed = time.time() - start_time
-        logging.error("Auto-discovery iteration failed to get allowed IPs (completed in %.2f s): %s", elapsed, e)
-        next_run = max(0, discovery_interval - elapsed)
-        Timer(next_run, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval, max_workers)).start()
+        logging.error("Failed to retrieve WireGuard peer data: %s", e)
         return
 
     total_peers = len(allowed_ips_map)
-    active_count = 0
-    inactive_count = 0
-    updated_count = 0
+    active_peers = {}
     discovery_peers = {}
+    inactive_peers = {}
+    peer_query_results = {}
 
-    # Use ThreadPoolExecutor to query peers in parallel.
+    # Detect active peers efficiently
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(query_peer, peer_key, allowed_ip, local_port): peer_key
-                   for peer_key, allowed_ip in allowed_ips_map.items()}
-        for future in concurrent.futures.as_completed(futures):
-            peer_key, allowed_ip, success, err = future.result()
-            if success:
-                active_count += 1
-                discovery_peers[peer_key] = allowed_ip
-            else:
-                inactive_count += 1
+        future_to_peer = {executor.submit(query_peer, peer_key, allowed_ip, local_port, max_retries): peer_key
+                          for peer_key, allowed_ip in allowed_ips_map.items()}
+        for future in concurrent.futures.as_completed(future_to_peer):
+            peer_key = future_to_peer[future]
+            try:
+                _, allowed_ip, success, _ = future.result()
+                peer_query_results[peer_key] = success
+                if success:
+                    active_peers[peer_key] = allowed_ip
+            except Exception as e:
+                logging.error("Error querying peer %s: %s", peer_key, e)
+                peer_query_results[peer_key] = False
 
-    # For each inactive peer, query discovery peers in parallel.
+    # Identify active discovery peers
+    for peer_key, allowed_ip in active_peers.items():
+        response = query_peer_data(f"http://{allowed_ip}:{local_port}/v1/endpoints", max_retries)
+        if response:
+            discovery_peers[peer_key] = allowed_ip
+
+    # Identify inactive peers
     for peer_key in remote_endpoints:
-        old_endpoint = remote_endpoints.get(peer_key)
-        if old_endpoint is None:
-            continue
-        if peer_key in discovery_peers:
-            continue  # Skip active peers.
+        if peer_key not in active_peers:
+            inactive_peers[peer_key] = remote_endpoints[peer_key]
+
+    # Attempt to update inactive peers using discovery peers
+    for peer_key, old_endpoint in inactive_peers.items():
         new_endpoint = None
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(query_peer_data, f"http://{disc_allowed_ip}:{local_port}/v1/endpoints"): disc_key
-                       for disc_key, disc_allowed_ip in allowed_ips_map.items() if disc_key != peer_key}
-            for future in concurrent.futures.as_completed(futures):
-                disc_key = futures[future]
-                try:
-                    disc_data = future.result()
-                    if disc_data and peer_key in disc_data and disc_data[peer_key]:
-                        candidate = disc_data[peer_key]
-                        if candidate != old_endpoint:
-                            new_endpoint = candidate
-                            logging.info("Found updated endpoint for peer %s from discovery node %s: old: %s, new: %s",
-                                         peer_key, disc_key, old_endpoint, new_endpoint)
-                            break
-                except Exception as e:
-                    logging.debug("Error querying discovery node %s: %s", disc_key, e)
+        for disc_key, disc_ip in discovery_peers.items():
+            response = query_peer_data(f"http://{disc_ip}:{local_port}/v1/endpoints", max_retries)
+            if response and peer_key in response:
+                candidate_endpoint = response[peer_key]
+                if candidate_endpoint and candidate_endpoint != old_endpoint:
+                    new_endpoint = candidate_endpoint
+                    break
+
         if new_endpoint and new_endpoint != old_endpoint:
             try:
                 wg_set_peer_endpoint(wg_interface, peer_key, new_endpoint, use_sudo)
                 logging.info("Updated peer %s endpoint from %s to %s", peer_key, old_endpoint, new_endpoint)
-                updated_count += 1
             except Exception as e:
-                logging.error("Failed to update peer %s (old: %s, new: %s): %s", peer_key, old_endpoint, new_endpoint, e)
+                logging.error("Failed to update peer %s: %s", peer_key, e)
 
     elapsed = time.time() - start_time
-    logging.info("Auto-discovery statistics: total peers: %d, active: %d, inactive: %d, discovery peers: %d, updated: %d, completed in: %.2f s",
-                 total_peers, active_count, inactive_count, len(discovery_peers), updated_count, elapsed)
-    next_run = max(0, discovery_interval - elapsed)
-    Timer(next_run, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval, max_workers)).start()
+    logging.info("Auto-discovery completed in %.2f seconds: total peers=%d, active=%d, discovery peers=%d, inactive=%d",
+                 elapsed, total_peers, len(active_peers), len(discovery_peers), len(inactive_peers))
+    Timer(discovery_interval, run_auto_discovery, args=(wg_interface, local_port, use_sudo, discovery_interval, max_workers, max_retries)).start()
 
 
 def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group,
-               auto_discovery, discovery_interval, max_workers):
+               auto_discovery, discovery_interval, max_workers, max_retries):
     handler_class = partial(WGEndpointHandler,
                             wg_interface=wg_interface,
                             allowed_ips=allowed_ips,
@@ -411,7 +403,7 @@ def run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, dr
         cache_thread.start()
         logging.debug("Cache update worker thread started.")
         if auto_discovery:
-            run_auto_discovery(wg_interface, port, use_sudo, discovery_interval, max_workers)
+            run_auto_discovery(wg_interface, port, use_sudo, discovery_interval, max_workers, max_retries)
             logging.debug("Auto-discovery process started.")
         try:
             httpd.serve_forever()
@@ -440,7 +432,10 @@ def parse_args():
                         help='Maximum time (in seconds) to wait for a cache update (default: 30)')
     parser.add_argument('--max-workers', type=int, default=10,
                         help='Maximum number of worker threads for parallel queries (default: 10)')
-    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+    parser.add_argument('--max-retries', type=int, default=1,
+                        help='Maximum number of retries for each HTTP query (default: 1)')
+    parser.add_argument('--log-level', type=lambda s: s.upper(), default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='Set the logging level (default: INFO)')
     return parser.parse_args()
 
@@ -476,12 +471,13 @@ def main():
     auto_discovery = args.auto_discovery
     discovery_interval = args.discovery_interval
     max_workers = args.max_workers
+    max_retries = args.max_retries
 
-    logging.info("Configuration: wg_interface=%s, bind_ip=%s, port=%d, allowed_ips=%s, use_sudo=%s, auto_discovery=%s, discovery_interval=%d, cache_freshness=%d, cache_wait_timeout=%d, max_workers=%d, user=%s, group=%s",
+    logging.info("Configuration: wg_interface=%s, bind_ip=%s, port=%d, allowed_ips=%s, use_sudo=%s, auto_discovery=%s, discovery_interval=%d, cache_freshness=%d, cache_wait_timeout=%d, max_workers=%d, max_retries=%d, user=%s, group=%s",
                  wg_interface, bind_ip, port, allowed_ips, use_sudo, auto_discovery,
-                 discovery_interval, args.cache_freshness, args.cache_wait_timeout, max_workers, drop_user, drop_group)
+                 discovery_interval, args.cache_freshness, args.cache_wait_timeout, max_workers, max_retries, drop_user, drop_group)
     run_server(bind_ip, port, wg_interface, allowed_ips, use_sudo, drop_user, drop_group,
-               auto_discovery, discovery_interval, max_workers)
+               auto_discovery, discovery_interval, max_workers, max_retries)
 
 
 if __name__ == "__main__":
