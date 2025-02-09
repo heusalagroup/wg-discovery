@@ -22,7 +22,7 @@ Intended to run as a systemd service on Linux (adaptable to macOS via launchd).
 Usage example:
     sudo python3 wg_endpoint_service.py --wg-interface wg0 --port 51820 \
       --allowed-ips 10.220.0.19,10.220.0.25 --use-sudo --user nobody --group nogroup \
-      --auto-discovery --discovery-interval 60
+      --auto-discovery --discovery-interval 60 --log-level DEBUG
 """
 
 import http.server
@@ -210,7 +210,7 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         if not self._check_source_ip():
             return
         parsed = urlparse(self.path)
-        # This endpoint returns the remote endpoints (from wg show endpoints).
+        # GET /v1/endpoints returns remote endpoint information.
         if parsed.path == "/v1/endpoints":
             try:
                 parsed_output = wg_show_endpoints(self.wg_interface, self.use_sudo)
@@ -230,7 +230,7 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
     """
     Periodically check local peers for activity and update endpoints for inactive peers.
 
-    1. Retrieve the allowed IPs mapping using 'wg show <interface> allowed-ips'.
+    1. Retrieve the allowed IPs mapping using 'wg show <interface> allowed-ips' to obtain each peer's internal WG IP.
     2. For each peer, attempt to connect to its discovery service at:
          http://<allowed_ip>:<local_port>/v1/endpoints
        If the peer is unreachable, consider it inactive.
@@ -256,7 +256,7 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
                         logging.info("Peer %s at %s is active", peer_key, allowed_ip)
                         continue
             except Exception as e:
-                logging.warning("Peer %s at %s is inactive: %s", peer_key, allowed_ip, e)
+                logging.debug("Peer %s at %s is inactive: %s", peer_key, allowed_ip, e)
                 inactive_peers[peer_key] = allowed_ip
 
         # For each inactive peer, query discovery peers for an updated endpoint.
@@ -270,13 +270,12 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
                     with urllib.request.urlopen(disc_url, timeout=5) as disc_response:
                         if disc_response.status == 200:
                             disc_data = json.loads(disc_response.read().decode("utf-8"))
-                            # disc_data is the endpoints mapping from the discovery node.
                             if peer_key in disc_data and disc_data[peer_key]:
                                 new_endpoint = disc_data[peer_key]
                                 logging.info("Found updated endpoint for peer %s from discovery node %s: %s", peer_key, disc_key, new_endpoint)
                                 break
                 except Exception as e:
-                    logging.warning("Error querying discovery node %s: %s", disc_key, e)
+                    logging.debug("Error querying discovery node %s: %s", disc_key, e)
             if new_endpoint and new_endpoint != inactive_peers[peer_key]:
                 try:
                     wg_set_peer_endpoint(wg_interface, peer_key, new_endpoint, use_sudo)
@@ -326,11 +325,18 @@ def parse_args():
     parser.add_argument('--auto-discovery', action='store_true', help='Enable auto-discovery of peer endpoints (default: disabled)')
     parser.add_argument('--discovery-interval', type=int, default=60,
                         help='Interval (in seconds) between auto-discovery checks (default: 60)')
+    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        help='Set the logging level (default: INFO)')
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    numeric_level = getattr(logging, args.log_level.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError("Invalid log level: %s" % args.log_level)
+    logging.basicConfig(level=numeric_level, format='%(asctime)s %(levelname)s: %(message)s')
+
     wg_interface = args.wg_interface
 
     if args.bind_ip:
@@ -358,5 +364,4 @@ def main():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
     main()
