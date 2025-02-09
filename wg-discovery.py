@@ -283,6 +283,7 @@ def query_peer(peer_key, allowed_ip, local_port, max_retries=1):
     """
     Query a peer's /v1/endpoints URL.
     Returns a tuple: (peer_key, allowed_ip, success flag, error message).
+    :rtype: object
     """
     url = f"http://{allowed_ip}:{local_port}/v1/endpoints"
     last_error = ""
@@ -332,6 +333,7 @@ def run_auto_discovery(wg_interface, local_port, use_sudo, discovery_interval, m
     discovery_peers = {}
     inactive_peers = {}
     peer_query_results = {}
+    discovery_peer_responses = {}
 
     # Detect active peers efficiently
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -348,31 +350,48 @@ def run_auto_discovery(wg_interface, local_port, use_sudo, discovery_interval, m
                 logging.error("Error querying peer %s: %s", peer_key, e)
                 peer_query_results[peer_key] = False
 
-    # Identify active discovery peers
-    for peer_key, allowed_ip in active_peers.items():
-        response = query_peer_data(f"http://{allowed_ip}:{local_port}/v1/endpoints", max_retries)
-        if response:
-            discovery_peers[peer_key] = allowed_ip
+    # Identify active discovery peers and cache their responses
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_disc_peer = {executor.submit(query_peer_data, f"http://{allowed_ip}:{local_port}/v1/endpoints", max_retries): peer_key
+                               for peer_key, allowed_ip in active_peers.items()}
+        for future in concurrent.futures.as_completed(future_to_disc_peer):
+            peer_key = future_to_disc_peer[future]
+            try:
+                response = future.result()
+                if response:
+                    discovery_peers[peer_key] = active_peers[peer_key]
+                    discovery_peer_responses[peer_key] = response
+            except Exception as e:
+                logging.error("Error querying discovery peer %s: %s", peer_key, e)
 
     # Identify inactive peers
     for peer_key in remote_endpoints:
         if peer_key not in active_peers:
             inactive_peers[peer_key] = remote_endpoints[peer_key]
 
-    # Attempt to update inactive peers using discovery peers
+    # Attempt to update inactive peers using cached discovery responses
     for peer_key, old_endpoint in inactive_peers.items():
         new_endpoint = None
-        for disc_key, disc_ip in discovery_peers.items():
-            response = query_peer_data(f"http://{disc_ip}:{local_port}/v1/endpoints", max_retries)
-            if response and peer_key in response:
+        for disc_key, response in discovery_peer_responses.items():
+            if peer_key in response:
                 candidate_endpoint = response[peer_key]
                 if candidate_endpoint and candidate_endpoint != old_endpoint:
                     new_endpoint = candidate_endpoint
                     break
 
         if new_endpoint and new_endpoint != old_endpoint:
+            with cache_lock:
+                current_endpoint = cached_endpoints.get(peer_key)
+
+            # Prevent redundant updates
+            if current_endpoint == new_endpoint:
+                logging.debug("Skipping redundant update for peer %s: already set to %s", peer_key, new_endpoint)
+                continue
+
             try:
                 wg_set_peer_endpoint(wg_interface, peer_key, new_endpoint, use_sudo)
+                with cache_lock:
+                    cached_endpoints[peer_key] = new_endpoint  # Update cache to prevent redundant updates
                 logging.info("Updated peer %s endpoint from %s to %s", peer_key, old_endpoint, new_endpoint)
             except Exception as e:
                 logging.error("Failed to update peer %s: %s", peer_key, e)
