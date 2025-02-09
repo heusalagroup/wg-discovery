@@ -51,6 +51,7 @@ import time
 import urllib.request
 from threading import Timer
 import concurrent.futures
+import ipaddress
 
 # Global cache variables and events.
 cached_endpoints = {}
@@ -62,6 +63,30 @@ cache_updated_event = threading.Event()
 # Configurable thresholds.
 CACHE_FRESHNESS_THRESHOLD = 15  # seconds: cache is fresh if updated within this many seconds.
 CACHE_WAIT_TIMEOUT = 30         # seconds: maximum time to wait for a cache update.
+
+
+def is_ip_allowed(client_ip, allowed_ips):
+    """
+    Check if the given client_ip is within the allowed IPs, which may include CIDR ranges.
+    """
+    for ip in allowed_ips:
+        try:
+            # If it's an exact IP match
+            if client_ip == ip:
+                return True
+            # If it's a CIDR range, check if the IP is in the network
+            if '/' in ip and ipaddress.ip_address(client_ip) in ipaddress.ip_network(ip, strict=False):
+                return True
+        except ValueError:
+            logging.warning("Invalid IP address or range in allowed list: %s", ip)
+    return False
+
+
+def parse_allowed_ips(allowed_ips_str):
+    """
+    Parse a comma-separated list of allowed IPs and CIDR ranges.
+    """
+    return {ip.strip() for ip in allowed_ips_str.split(',') if ip.strip()}
 
 
 def get_interface_ip(ifname):
@@ -243,7 +268,7 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         if not self.allowed_ips:
             return True
         client_ip = self.client_address[0]
-        if client_ip not in self.allowed_ips:
+        if not is_ip_allowed(client_ip, self.allowed_ips):
             logging.warning("Rejected connection from unauthorized IP: %s", client_ip)
             self._send_json_response(403, {"error": "Forbidden"})
             return False
@@ -482,7 +507,7 @@ def main():
             sys.exit(1)
 
     port = args.port
-    allowed_ips = {ip.strip() for ip in args.allowed_ips.split(',') if ip.strip()}
+    allowed_ips = parse_allowed_ips(args.allowed_ips)
     allowed_ips.add(bind_ip)
     use_sudo = args.use_sudo
     drop_user = args.user if args.user != "" else None
