@@ -271,12 +271,12 @@ def auto_discovery_loop(wg_interface, local_port, use_sudo, discovery_interval):
             try:
                 with urllib.request.urlopen(url, timeout=5) as response:
                     if response.status == 200:
-                        logging.info("Peer %s at allowed IP %s is active", peer_key, allowed_ip)
+                        logging.debug("%s %s: active", peer_key, allowed_ip)
                         active_count += 1
                         discovery_peers[peer_key] = allowed_ip
                         continue
             except Exception as e:
-                logging.debug("Peer %s at allowed IP %s is inactive: %s", peer_key, allowed_ip, e)
+                logging.debug("%s %s: inactive: %s", peer_key, allowed_ip, e)
                 inactive_count += 1
 
         # For each inactive peer, query discovery peers for an updated endpoint.
