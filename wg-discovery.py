@@ -65,6 +65,20 @@ CACHE_FRESHNESS_THRESHOLD = 15  # seconds: cache is fresh if updated within this
 CACHE_WAIT_TIMEOUT = 30         # seconds: maximum time to wait for a cache update.
 
 
+def is_internal_ip_reachable(ip):
+    """
+    Check if an internal WireGuard IP is reachable using an ICMP ping.
+    Returns True if reachable, False otherwise.
+    """
+    try:
+        result = subprocess.run(["ping", "-c", "1", "-W", "1", ip],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def is_ip_allowed(client_ip, allowed_ips):
     """
     Check if the given client_ip is within the allowed IPs, which may include CIDR ranges.
@@ -224,19 +238,33 @@ def wg_set_peer_endpoint(wg_interface, peer_key, new_endpoint, use_sudo=False):
 def cache_update_worker(wg_interface, use_sudo):
     """
     Background worker that waits for an event trigger to update the cache.
-    When triggered by a GET request, it updates the global cached_endpoints and last_cache_update_time,
-    then signals that fresh data is available.
+    When triggered by a GET request, it updates the global cached_endpoints and last_cache_update_time.
+    It also filters out peers whose internal WireGuard IPs are unreachable.
     """
     global cached_endpoints, last_cache_update_time
     while True:
         cache_update_event.wait()
         try:
             endpoints = wg_show_endpoints(wg_interface, use_sudo)
+            allowed_ips = wg_show_allowed_ips(wg_interface, use_sudo)
+
+            # Check reachability of internal WireGuard IPs in parallel
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future_to_peer = {executor.submit(is_internal_ip_reachable, ip): peer_key
+                                  for peer_key, ip in allowed_ips.items()}
+                reachable_peers = {future_to_peer[future]: allowed_ips[future_to_peer[future]]
+                                   for future in concurrent.futures.as_completed(future_to_peer)
+                                   if future.result()}
+
             with cache_lock:
-                cached_endpoints = endpoints
+                # Store only the endpoints of reachable peers
+                cached_endpoints = {peer_key: endpoints[peer_key]
+                                    for peer_key in reachable_peers
+                                    if peer_key in endpoints and endpoints[peer_key] is not None}
                 last_cache_update_time = time.time()
+
             cache_updated_event.set()
-            logging.debug("Cache updated on demand: %s", endpoints)
+            logging.debug("Cache updated on demand: %s", cached_endpoints)
         except Exception as e:
             logging.error("Failed to update endpoints cache on demand: %s", e)
             cache_updated_event.set()
@@ -300,8 +328,8 @@ class WGEndpointHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._send_json_response(404, {"error": "Not Found"})
 
-    def log_message(self, format, *args):
-        logging.info("%s - %s", self.address_string(), format % args)
+    def log_message(self, fmt, *args):
+        logging.info("%s - %s", self.address_string(), fmt % args)
 
 
 def query_peer(peer_key, allowed_ip, local_port, max_retries=1):
@@ -316,24 +344,23 @@ def query_peer(peer_key, allowed_ip, local_port, max_retries=1):
         try:
             with urllib.request.urlopen(url, timeout=5) as response:
                 if response.status == 200:
-                    return (peer_key, allowed_ip, True, "")
+                    return peer_key, allowed_ip, True, ""
         except Exception as e:
             last_error = str(e)
-    return (peer_key, allowed_ip, False, last_error)
+    return peer_key, allowed_ip, False, last_error
 
 
 def query_peer_data(url, max_retries=1):
     """
     Query a given URL and return JSON data.
     """
-    last_error = ""
     for i in range(max_retries):
         try:
             with urllib.request.urlopen(url, timeout=5) as response:
                 if response.status == 200:
                     return json.loads(response.read().decode("utf-8"))
-        except Exception as e:
-            last_error = str(e)
+        except Exception:
+            return None
     return None
 
 

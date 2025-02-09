@@ -12,8 +12,11 @@ service, providing a JSON API to:
 
 `wg-discovery` is designed to work in decentralized WireGuard setups — helping 
 peers to detect one another’s direct connection details automatically without 
-relying on a central servers to forward traffic. Only connection end point 
-details are provided to peers through other nodes in the WireGuard network.
+relying on a central servers to forward actual traffic. Only the connection 
+endpoint details are provided to peers through other nodes in the WireGuard 
+network. For this to work over NAT networks (including NAT vs NAT), at least one of 
+the nodes within the network have to have public IP and this discovery service
+available.
 
 It is intended to be run on the internal WireGuard network and secured by 
 WireGuard's own security layers. It is **NOT** intended to be exposed as a 
