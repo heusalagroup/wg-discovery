@@ -41,7 +41,6 @@ import sys
 import struct
 import re
 import os
-import grp
 from urllib.parse import urlparse
 from functools import partial
 import threading
@@ -150,6 +149,7 @@ def drop_privileges(user, group):
     If group is not specified, use the user's primary group.
     """
     import pwd
+    import grp
 
     if os.getuid() != 0:
         return
