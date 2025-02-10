@@ -108,12 +108,13 @@ def get_interface_ip(ifname):
     """
 
     if platform.system() == "Windows":
-        import psutil
-        addrs = psutil.net_if_addrs()
-        if ifname in addrs:
-            for addr in addrs[ifname]:
-                if addr.family == socket.AF_INET:
-                    return addr.address
+        try:
+            result = subprocess.run(["ipconfig"], capture_output=True, text=True)
+            match = re.search(rf"{ifname}.*?IPv4 Address[^\d]+([\d.]+)", result.stdout, re.DOTALL)
+            if match:
+                return match.group(1)
+        except Exception as e:
+            raise RuntimeError(f"Could not determine IP for interface {ifname}: {e}")
         return None
 
     if sys.platform.startswith("darwin"):
