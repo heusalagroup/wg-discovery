@@ -39,7 +39,6 @@ import argparse
 import socket
 import sys
 import struct
-import fcntl
 import re
 import os
 import pwd
@@ -52,6 +51,7 @@ import urllib.request
 from threading import Timer
 import concurrent.futures
 import ipaddress
+import platform
 
 # Global cache variables and events.
 cached_endpoints = {}
@@ -108,6 +108,16 @@ def get_interface_ip(ifname):
     Get the IPv4 address assigned to the network interface ifname.
     Uses ioctl on Linux and ifconfig parsing on macOS.
     """
+
+    if platform.system() == "Windows":
+        import psutil
+        addrs = psutil.net_if_addrs()
+        if ifname in addrs:
+            for addr in addrs[ifname]:
+                if addr.family == socket.AF_INET:
+                    return addr.address
+        return None
+
     if sys.platform.startswith("darwin"):
         try:
             output = subprocess.check_output(["ifconfig", ifname], text=True)
@@ -118,19 +128,21 @@ def get_interface_ip(ifname):
             return match.group(1)
         else:
             raise RuntimeError(f"Could not determine IP for interface {ifname} from ifconfig output")
-    else:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            ip_addr = socket.inet_ntoa(
-                fcntl.ioctl(
-                    s.fileno(),
-                    0x8915,  # SIOCGIFADDR
-                    struct.pack('256s', ifname[:15].encode('utf-8'))
-                )[20:24]
-            )
-        except Exception as e:
-            raise RuntimeError(f"Could not determine IP for interface {ifname}: {e}")
-        return ip_addr
+
+    # Linux/macOS: use `fcntl`
+    import fcntl
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        ip_addr = socket.inet_ntoa(
+            fcntl.ioctl(
+                s.fileno(),
+                0x8915,  # SIOCGIFADDR
+                struct.pack('256s', ifname[:15].encode('utf-8'))
+            )[20:24]
+        )
+    except Exception as e:
+        raise RuntimeError(f"Could not determine IP for interface {ifname}: {e}")
+    return ip_addr
 
 
 def drop_privileges(user, group):
