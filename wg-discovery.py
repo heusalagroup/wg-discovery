@@ -69,7 +69,12 @@ def is_internal_ip_reachable(ip):
     Returns True if reachable, False otherwise.
     """
     try:
-        result = subprocess.run(["ping", "-c", "1", "-W", "1", ip],
+        if platform.system() == "Windows":
+            cmd = ["ping", "-n", "1", "-w", "1", ip]
+        else:
+            cmd = ["ping", "-c", "1", "-W", "1", ip]
+
+        result = subprocess.run(cmd,
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
         return result.returncode == 0
