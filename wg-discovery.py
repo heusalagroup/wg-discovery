@@ -41,7 +41,6 @@ import sys
 import struct
 import re
 import os
-import pwd
 import grp
 from urllib.parse import urlparse
 from functools import partial
@@ -150,6 +149,8 @@ def drop_privileges(user, group):
     Drop root privileges by switching to the specified user and group.
     If group is not specified, use the user's primary group.
     """
+    import pwd
+
     if os.getuid() != 0:
         return
     try:
